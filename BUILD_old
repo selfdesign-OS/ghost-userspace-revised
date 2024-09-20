@@ -82,6 +82,31 @@ agent_lib_deps = [
     "@com_google_absl//absl/synchronization",
     "@linux//:libbpf",
 ]
+# BUILD 파일: 프로젝트의 메인 빌드 설정
+
+cc_binary(
+    name = "agent_round_robin",  # 새로운 타겟 이름
+    srcs = [
+        "round_robin_agent.cc",  # main 함수가 있는 파일
+        "schedulers/round_robin/round_robin_scheduler.cc",  # Round Robin 스케줄러 소스 파일
+        "schedulers/round_robin/round_robin_scheduler.h",  # Round Robin 스케줄러 헤더 파일
+    ],
+    copts = compiler_flags,  # 동일한 컴파일러 옵션 사용
+    deps = [
+        ":agent",  # ghOSt 에이전트 관련 종속성
+        ":base",  # 기본 라이브러리 종속성
+        ":topology",  # 시스템 토폴로지 관련 종속성
+        "@com_google_absl//absl/container:flat_hash_map",  # Abseil flat hash map
+        "@com_google_absl//absl/debugging:symbolize",  # 디버깅 심볼
+        "@com_google_absl//absl/flags:parse",  # 플래그 파싱
+        "@com_google_absl//absl/functional:any_invocable",  # AnyInvocable 기능적 유틸리티
+        "@com_google_absl//absl/numeric:int128",  # 128비트 정수 라이브러리
+        "@com_google_absl//absl/strings:str_format",  # 문자열 형식화 라이브러리
+        "@com_google_absl//absl/synchronization",  # 동기화 라이브러리
+        "@com_google_absl//absl/time",  # 시간 관련 라이브러리
+    ],
+)
+
 
 cc_library(
     name = "trivial_status",
@@ -672,7 +697,6 @@ cc_binary(
     ],
 )
 
-
 cc_test(
     name = "fd_server_test",
     size = "small",
@@ -683,34 +707,6 @@ cc_test(
     deps = [
         ":shared",
         "@com_google_googletest//:gtest_main",
-    ],
-)
-cc_binary(
-    name = "roundrobin",
-    srcs = [
-        "schedulers/round_robin/roundrobin_agent.cc",
-    ],
-    copts = compiler_flags,
-    deps = [
-        ":agent",
-        ":roundrobin_scheduler",
-        "@com_google_absl//absl/debugging:symbolize",
-        "@com_google_absl//absl/flags:parse",
-        "@com_google_absl//absl/time:time",
-    ],
-)
-cc_library(
-    name = "roundrobin_scheduler",
-    srcs = [
-        "schedulers/round_robin/roundrobin_scheduler.cc",
-        "schedulers/round_robin/roundrobin_scheduler.h",
-    ],
-    hdrs = [
-        "schedulers/round_robin/roundrobin_scheduler.h",
-    ],
-    copts = compiler_flags,
-    deps = [
-        ":agent",
     ],
 )
 
