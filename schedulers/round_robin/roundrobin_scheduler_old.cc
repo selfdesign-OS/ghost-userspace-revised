@@ -221,7 +221,7 @@ void RoundRobinScheduler::TaskOnCpu(RoundRobinTask* task, Cpu cpu) {
   CpuState* cs = cpu_state(cpu);
   cs->current = task;
 
-  GHOST_DPRINT(1, stderr, "Task %s oncpu %d", task->gtid.describe(), cpu.id());
+  GHOST_DPRINT(3, stderr, "Task %s oncpu %d", task->gtid.describe(), cpu.id());
 
   task->run_state = RoundRobinTaskState::kOnCpu;
   task->cpu = cpu.id();
@@ -229,21 +229,14 @@ void RoundRobinScheduler::TaskOnCpu(RoundRobinTask* task, Cpu cpu) {
   task->prio_boost = false;
 }
 
-
-
 void RoundRobinScheduler::RoundRobinSchedule(const Cpu& cpu, BarrierToken agent_barrier, bool prio_boost) {
   CpuState* cs = cpu_state(cpu);
-  RoundRobinTask* next = cs->run_queue.Dequeue();  // Fetch task in round-robin order
+  RoundRobinTask* next = cs->run_queue.Dequeue();  // 라운드 로빈 방식으로 프로세스 할당
 
   if (!next) {
-    // No task to run, set CPU to idle
+    // 실행할 작업이 없으면 CPU를 유휴 상태로 만듦
     enclave()->GetRunRequest(cpu)->LocalYield(agent_barrier, 0);
     return;
-  }
-
-  // Ensure the task is not already running on another CPU
-  while (next->status_word.on_cpu()) {
-    Pause();  // Wait until task is off the CPU
   }
 
   RunRequest* req = enclave()->GetRunRequest(cpu);
@@ -251,40 +244,24 @@ void RoundRobinScheduler::RoundRobinSchedule(const Cpu& cpu, BarrierToken agent_
       .target = next->gtid,
       .target_barrier = next->seqnum,
       .agent_barrier = agent_barrier,
-      .commit_flags = COMMIT_AT_TXN_COMMIT,
+      .commit_flags = COMMIT_AT_TXN_COMMIT
   });
 
   if (req->Commit()) {
-    // Set a time slice of 100 milliseconds for the round-robin task
-    const absl::Duration time_slice = absl::Milliseconds(10);
-
-    // Task is successfully scheduled on the CPU
+    // 타임 슬라이스를 100밀리초로 설정 (타이머 관리 필요)
+    const absl::Duration time_slice = absl::Milliseconds(100);
+    
+    // 작업이 성공적으로 실행됨
     TaskOnCpu(next, cpu);
 
-    // Sleep for the duration of the time slice before swapping tasks
-    absl::SleepFor(time_slice);
-
-    // Trigger CPU task replacement via Ping
-    enclave()->GetAgent(cpu)->Ping();
+    // 타임 슬라이스가 끝나면 Ping을 통해 CPU 작업 교체
+    absl::SleepFor(time_slice);  // 타임 슬라이스 동안 작업을 실행
+    enclave()->GetAgent(cpu)->Ping();  // 타임 슬라이스가 끝난 후 Ping으로 작업 교체
   } else {
-    // Scheduling failed, mark task as off the CPU if it was current
-    if (next == cs->current) {
-      TaskOffCpu(next, /*blocked=*/false, /*from_switchto=*/false);
-    }
-
-    // Requeue task and set priority boost
-    next->prio_boost = true;
+    // 실행 실패 시 다시 큐에 추가
     cs->run_queue.Enqueue(next);
   }
 }
-
-
-
-
-
-
-
-
 
 
 
@@ -394,8 +371,6 @@ std::ostream& operator<<(std::ostream& os, const RoundRobinTaskState& state) {
       return os << "kQueued";
     case RoundRobinTaskState::kOnCpu:
       return os << "kOnCpu";
-      default:
-      return os << "UnknownState";  // Handle any unexpected cases
   }
 }
 
