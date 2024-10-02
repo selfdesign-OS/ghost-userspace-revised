@@ -713,34 +713,7 @@ cc_library(
         ":agent",
     ],
 )
-cc_binary(
-    name = "O-one",
-    srcs = [
-        "schedulers/O-one/O-one_agent.cc",
-    ],
-    copts = compiler_flags,
-    deps = [
-        ":agent",
-        ":O-one_scheduler",
-        "@com_google_absl//absl/debugging:symbolize",
-        "@com_google_absl//absl/flags:parse",
-        "@com_google_absl//absl/time:time",
-    ],
-)
-cc_library(
-    name = "O-one_scheduler",
-    srcs = [
-        "schedulers/O-one/O-one_scheduler.cc",
-        "schedulers/O-one/O-one_scheduler.h",
-    ],
-    hdrs = [
-        "schedulers/O-one/O-one_scheduler.h",
-    ],
-    copts = compiler_flags,
-    deps = [
-        ":agent",
-    ],
-)
+
 cc_binary(
     name = "fifo_per_cpu_agent",
     srcs = [
