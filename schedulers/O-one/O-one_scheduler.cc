@@ -6,6 +6,7 @@
 
 #include "schedulers/O-one/O-one_scheduler.h"
 #include "absl/time/time.h"  // 필요 시 absl 시간 라이브러리 포함
+
 #include <memory>
 
 namespace ghost {
@@ -41,23 +42,16 @@ void RoundRobinScheduler::DumpState(const Cpu& cpu, int flags) {
   }
 
   CpuState* cs = cpu_state(cpu);
-
   if (!(flags & Scheduler::kDumpStateEmptyRQ) && !cs->current &&
-      cs->active_queue.Empty()) {  // run_queue -> active_queue로 변경
+      cs->run_queue.Empty()) {
     return;
   }
 
   const RoundRobinTask* current = cs->current;
-  // 우선순위 큐에서 태스크를 가져와서 상태를 덤프
-  for (int i = 0; i < 140; ++i) {
-    if (!cs->active_queue.priority_queues[i].empty()) {
-      absl::FPrintF(stderr, "SchedState[%d]: %s rq_l=%lu\n", cpu.id(),
-                    current ? current->gtid.describe() : "none",
-                    cs->active_queue.priority_queues[i].size());
-    }
-  }
+  const RoundRobinTaskRq* rq = &cs->run_queue;
+  absl::FPrintF(stderr, "SchedState[%d]: %s rq_l=%lu\n", cpu.id(),
+                current ? current->gtid.describe() : "none", rq->Size());
 }
-
 
 void RoundRobinScheduler::EnclaveReady() {
   for (const Cpu& cpu : cpus()) {
@@ -94,7 +88,7 @@ void RoundRobinScheduler::Migrate(RoundRobinTask* task, Cpu cpu, BarrierToken se
                cpu.id());
   task->cpu = cpu.id();
 
-  cs->active_queue.Enqueue(task);
+  cs->run_queue.Enqueue(task);
 
   enclave()->GetAgent(cpu)->Ping();
 }
@@ -127,7 +121,7 @@ void RoundRobinScheduler::TaskRunnable(RoundRobinTask* task, const Message& msg)
     Migrate(task, cpu, msg.seqnum());
   } else {
     CpuState* cs = cpu_state_of(task);
-    cs->active_queue.Enqueue(task);
+    cs->run_queue.Enqueue(task);
   }
 }
 
@@ -139,7 +133,7 @@ void RoundRobinScheduler::TaskDeparted(RoundRobinTask* task, const Message& msg)
     TaskOffCpu(task, /*blocked=*/false, payload->from_switchto);
   } else if (task->queued()) {
     CpuState* cs = cpu_state_of(task);
-    cs->active_queue.Erase(task);
+    cs->run_queue.Erase(task);
   } else {
     CHECK(task->blocked());
   }
@@ -164,7 +158,7 @@ void RoundRobinScheduler::TaskYield(RoundRobinTask* task, const Message& msg) {
   TaskOffCpu(task, /*blocked=*/false, payload->from_switchto);
 
   CpuState* cs = cpu_state_of(task);
-  cs->active_queue.Enqueue(task);
+  cs->run_queue.Enqueue(task);
 
   if (payload->from_switchto) {
     Cpu cpu = topology()->cpu(payload->cpu);
@@ -193,7 +187,7 @@ void RoundRobinScheduler::TaskPreempted(RoundRobinTask* task, const Message& msg
   task->preempted = true;
   task->prio_boost = true;
   CpuState* cs = cpu_state_of(task);
-  cs->active_queue.Enqueue(task);
+  cs->run_queue.Enqueue(task);
 
   if (payload->from_switchto) {
     Cpu cpu = topology()->cpu(payload->cpu);
@@ -205,8 +199,10 @@ void RoundRobinScheduler::TaskSwitchto(RoundRobinTask* task, const Message& msg)
   TaskOffCpu(task, /*blocked=*/true, /*from_switchto=*/false);
 }
 
-void RoundRobinScheduler::TaskOffCpu(RoundRobinTask* task, bool blocked, bool from_switchto) {
-  GHOST_DPRINT(3, stderr, "Task %s offcpu %d", task->gtid.describe(), task->cpu);
+void RoundRobinScheduler::TaskOffCpu(RoundRobinTask* task, bool blocked,
+                               bool from_switchto) {
+  GHOST_DPRINT(3, stderr, "Task %s offcpu %d", task->gtid.describe(),
+               task->cpu);
   CpuState* cs = cpu_state_of(task);
 
   if (task->oncpu()) {
@@ -217,15 +213,9 @@ void RoundRobinScheduler::TaskOffCpu(RoundRobinTask* task, bool blocked, bool fr
     CHECK_EQ(task->run_state, RoundRobinTaskState::kBlocked);
   }
 
-  task->run_state = blocked ? RoundRobinTaskState::kBlocked : RoundRobinTaskState::kRunnable;
-
-  // 태스크가 blocked 상태가 아니면 다시 큐에 삽입
-  if (!blocked) {
-
-      cs->expired_queue.Enqueue(task);  // 만료 큐로 이동
-  }
+  task->run_state =
+      blocked ? RoundRobinTaskState::kBlocked : RoundRobinTaskState::kRunnable;
 }
-
 
 void RoundRobinScheduler::TaskOnCpu(RoundRobinTask* task, Cpu cpu) {
   CpuState* cs = cpu_state(cpu);
@@ -237,87 +227,23 @@ void RoundRobinScheduler::TaskOnCpu(RoundRobinTask* task, Cpu cpu) {
   task->cpu = cpu.id();
   task->preempted = false;
   task->prio_boost = false;
-
-  // 더 이상 active_queue에 있지 않으므로 해당 task를 active_queue에서 제거
-  cs->active_queue.Erase(task);
 }
 
 
 
-
-// void RoundRobinScheduler::RoundRobinSchedule(const Cpu& cpu, BarrierToken agent_barrier, bool prio_boost) {
-//   CpuState* cs = cpu_state(cpu);
-//   RoundRobinTask* next = cs->run_queue.Dequeue();  // Fetch task in round-robin order
-
-//   if (!next) {
-//     // No task to run, set CPU to idle
-//     enclave()->GetRunRequest(cpu)->LocalYield(agent_barrier, 0);
-//     return;
-//   }
-
-//   // Ensure the task is not already running on another CPU
-//   while (next->status_word.on_cpu()) {
-//     Pause();  // Wait until task is off the CPU
-//   }
-
-//   RunRequest* req = enclave()->GetRunRequest(cpu);
-//   req->Open({
-//       .target = next->gtid,
-//       .target_barrier = next->seqnum,
-//       .agent_barrier = agent_barrier,
-//       .commit_flags = COMMIT_AT_TXN_COMMIT,
-//   });
-
-//   if (req->Commit()) {
-//     // Set a time slice of 100 milliseconds for the round-robin task
-//     const absl::Duration time_slice = absl::Milliseconds(10);
-
-//     // Task is successfully scheduled on the CPU
-//     TaskOnCpu(next, cpu);
-
-//     // Sleep for the duration of the time slice before swapping tasks
-//     absl::SleepFor(time_slice);
-
-//     // Trigger CPU task replacement via Ping
-//     enclave()->GetAgent(cpu)->Ping();
-//   } else {
-//     // Scheduling failed, mark task as off the CPU if it was current
-//     if (next == cs->current) {
-//       TaskOffCpu(next, /*blocked=*/false, /*from_switchto=*/false);
-//     }
-
-//     // Requeue task and set priority boost
-//     next->prio_boost = true;
-//     cs->run_queue.Enqueue(next);
-//   }
-// }
-
-
 void RoundRobinScheduler::RoundRobinSchedule(const Cpu& cpu, BarrierToken agent_barrier, bool prio_boost) {
   CpuState* cs = cpu_state(cpu);
-
-  // 활성 큐와 만료 큐 교체 필요 시 교체
-  cs->active_queue.SwitchQueuesIfNeeded(cs);
-
-  // 우선순위가 높은 큐부터 태스크를 가져옴
-  RoundRobinTask* next = nullptr;
-  for (int i = 0; i < 140; ++i) {
-    if (!cs->active_queue.priority_queues[i].empty()) {
-      next = cs->active_queue.priority_queues[i].front();
-      cs->active_queue.priority_queues[i].pop_front();
-      break;
-    }
-  }
+  RoundRobinTask* next = cs->run_queue.Dequeue();  // Fetch task in round-robin order
 
   if (!next) {
-    // 실행할 태스크가 없으면 CPU를 idle 상태로 설정
+    // No task to run, set CPU to idle
     enclave()->GetRunRequest(cpu)->LocalYield(agent_barrier, 0);
     return;
   }
 
-  // 태스크가 다른 CPU에서 실행 중인 경우를 대비한 선점 처리
+  // Ensure the task is not already running on another CPU
   while (next->status_word.on_cpu()) {
-    Pause();
+    Pause();  // Wait until task is off the CPU
   }
 
   RunRequest* req = enclave()->GetRunRequest(cpu);
@@ -329,16 +255,30 @@ void RoundRobinScheduler::RoundRobinSchedule(const Cpu& cpu, BarrierToken agent_
   });
 
   if (req->Commit()) {
+    // Set a time slice of 100 milliseconds for the round-robin task
+    const absl::Duration time_slice = absl::Milliseconds(10);
+
+    // Task is successfully scheduled on the CPU
     TaskOnCpu(next, cpu);
-    absl::SleepFor(absl::Milliseconds(10));  // 시간 할당량 조절
-    enclave()->GetAgent(cpu)->Ping();  // 다음 태스크로 교체
+
+    // Sleep for the duration of the time slice before swapping tasks
+    absl::SleepFor(time_slice);
+
+    // Trigger CPU task replacement via Ping
+    enclave()->GetAgent(cpu)->Ping();
   } else {
+    // Scheduling failed, mark task as off the CPU if it was current
     if (next == cs->current) {
       TaskOffCpu(next, /*blocked=*/false, /*from_switchto=*/false);
     }
-    cs->active_queue.priority_queues[next->priority].push_back(next);
+
+    // Requeue task and set priority boost
+    next->prio_boost = true;
+    cs->run_queue.Enqueue(next);
   }
 }
+
+
 
 
 
@@ -364,86 +304,45 @@ void RoundRobinScheduler::Schedule(const Cpu& cpu, const StatusWord& agent_sw) {
   RoundRobinSchedule(cpu, agent_barrier, agent_sw.boosted_priority());
 }
 
-void O1PriorityQueue::Enqueue(RoundRobinTask* task) {
+void RoundRobinTaskRq::Enqueue(RoundRobinTask* task) {
   CHECK_GE(task->cpu, 0);
   CHECK_EQ(task->run_state, RoundRobinTaskState::kRunnable);
 
   task->run_state = RoundRobinTaskState::kQueued;
 
-
   absl::MutexLock lock(&mu_);
   if (task->prio_boost)
-    priority_queues[0].push_front(task);
+    rq_.push_front(task);
   else
-    priority_queues[0].push_back(task);
+    rq_.push_back(task);
 }
 
-RoundRobinTask* O1PriorityQueue::Dequeue() {
+RoundRobinTask* RoundRobinTaskRq::Dequeue() {
   absl::MutexLock lock(&mu_);
-  if (priority_queues[0].empty()) return nullptr;
+  if (rq_.empty()) return nullptr;
 
-  RoundRobinTask* task = priority_queues[0].front();
+  RoundRobinTask* task = rq_.front();
   CHECK(task->queued());
   task->run_state = RoundRobinTaskState::kRunnable;
-  priority_queues[0].pop_front();
+  rq_.pop_front();
   return task;
 }
 
-// void O1PriorityQueue::EnqueueTask(RoundRobinTask* task) {
-//   // 태스크를 우선순위에 맞게 활성 큐에 삽입
-//   int priority = task->priority; 
-//   cpu_state_of(task)->active_queue.priority_queues[priority].push_back(task);
-// }
-
-// 우선순위가 높은 큐에서 Task를 선택하는 함수
-// RoundRobinTask* O1PriorityQueue::DequeueTask() {
-//   for (int priority = 0; priority < 140; ++priority) {
-//     if (!cpu_state()->active_queue.priority_queues[priority].empty()) {
-//       RoundRobinTask* task = cpu_state()->active_queue.priority_queues[priority].front();
-//       cpu_state()->active_queue.priority_queues[priority].pop_front();
-//       return task;
-//     }
-//   }
-//   return nullptr;  // 실행할 Task가 없는 경우
-// }
-void O1PriorityQueue::SwitchQueuesIfNeeded(RoundRobinScheduler::CpuState* cs) {
-    bool active_empty = true;
-
-    // 활성 큐가 비었는지 확인
-    for (int i = 0; i < 140; ++i) {
-        if (!cs->active_queue.priority_queues[i].empty()) {
-            active_empty = false;
-            break;
-        }
-    }
-
-    // 활성 큐가 비어 있으면 만료 큐와 교체
-    if (active_empty) {
-        swap(cs->active_queue, cs->expired_queue);  // 두 큐를 교체
-    }
-}
-
-
-
-
-
-
-
-void O1PriorityQueue::Erase(RoundRobinTask* task) {
+void RoundRobinTaskRq::Erase(RoundRobinTask* task) {
   CHECK_EQ(task->run_state, RoundRobinTaskState::kQueued);
   absl::MutexLock lock(&mu_);
-  size_t size = priority_queues[0].size();
+  size_t size = rq_.size();
   if (size > 0) {
     size_t pos = size - 1;
-    if (priority_queues[0][pos] == task) {
-      priority_queues[0].erase(priority_queues[0].cbegin() + pos);
+    if (rq_[pos] == task) {
+      rq_.erase(rq_.cbegin() + pos);
       task->run_state = RoundRobinTaskState::kRunnable;
       return;
     }
 
     for (pos = 0; pos < size - 1; pos++) {
-      if (priority_queues[0][pos] == task) {
-        priority_queues[0].erase(priority_queues[0].cbegin() + pos);
+      if (rq_[pos] == task) {
+        rq_.erase(rq_.cbegin() + pos);
         task->run_state =  RoundRobinTaskState::kRunnable;
         return;
       }
