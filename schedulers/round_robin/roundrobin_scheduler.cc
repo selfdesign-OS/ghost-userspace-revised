@@ -264,8 +264,8 @@ void RoundRobinScheduler::RoundRobinSchedule(const Cpu& cpu, BarrierToken agent_
     // Sleep for the duration of the time slice before swapping tasks
     absl::SleepFor(time_slice);
 
-    // Trigger CPU task replacement via Ping
     enclave()->GetAgent(cpu)->Ping();
+    
   } else {
     // Scheduling failed, mark task as off the CPU if it was current
     if (next == cs->current) {

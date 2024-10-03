@@ -138,6 +138,8 @@ class RoundRobinScheduler : public BasicDispatchScheduler<RoundRobinTask> {
     RoundRobinTask* current = nullptr;
     std::unique_ptr<Channel> channel = nullptr;
     RoundRobinTaskRq run_queue;
+    RoundRobinTaskRq expired_queue;
+
   } ABSL_CACHELINE_ALIGNED;
 
   inline CpuState* cpu_state(const Cpu& cpu) { return &cpu_states_[cpu.id()]; }

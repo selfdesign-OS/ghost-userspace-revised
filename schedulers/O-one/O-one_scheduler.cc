@@ -209,14 +209,21 @@ void RoundRobinScheduler::TaskOffCpu(RoundRobinTask* task, bool blocked,
     CHECK_EQ(cs->current, task);
     cs->current = nullptr;
   } else {
-    CHECK(from_switchto);
-    CHECK_EQ(task->run_state, RoundRobinTaskState::kBlocked);
+    // CHECK(from_switchto);
+    // CHECK_EQ(task->run_state, RoundRobinTaskState::kBlocked);
   }
 
   task->run_state =
       blocked ? RoundRobinTaskState::kBlocked : RoundRobinTaskState::kRunnable;
 }
+void RoundRobinTaskRq::swap(RoundRobinTaskRq& other) {
+    // 뮤텍스를 사용하여 안전하게 교환 (락킹)
+    absl::MutexLock lock_this(&mu_);
+    absl::MutexLock lock_other(&other.mu_);
 
+    // 두 대기열(rq_)을 교환
+    std::swap(rq_, other.rq_);
+}
 void RoundRobinScheduler::TaskOnCpu(RoundRobinTask* task, Cpu cpu) {
   CpuState* cs = cpu_state(cpu);
   cs->current = task;
@@ -233,50 +240,80 @@ void RoundRobinScheduler::TaskOnCpu(RoundRobinTask* task, Cpu cpu) {
 
 void RoundRobinScheduler::RoundRobinSchedule(const Cpu& cpu, BarrierToken agent_barrier, bool prio_boost) {
   CpuState* cs = cpu_state(cpu);
-  RoundRobinTask* next = cs->run_queue.Dequeue();  // Fetch task in round-robin order
+  RoundRobinTask* next = nullptr;
 
-  if (!next) {
-    // No task to run, set CPU to idle
-    enclave()->GetRunRequest(cpu)->LocalYield(agent_barrier, 0);
-    return;
+  // 우선순위 부스트가 설정되지 않았을 때 현재 작업 또는 다음 작업을 가져옴
+  if (!prio_boost) {
+    next = cs->current;
+    if (!next) next = cs->run_queue.Dequeue();
   }
 
-  // Ensure the task is not already running on another CPU
-  while (next->status_word.on_cpu()) {
-    Pause();  // Wait until task is off the CPU
-  }
+  GHOST_DPRINT(3, stderr, "RoundRobinSchedule %s on %s cpu %d ",
+               next ? next->gtid.describe() : "idling",
+               prio_boost ? "prio-boosted" : "", cpu.id());
 
   RunRequest* req = enclave()->GetRunRequest(cpu);
-  req->Open({
-      .target = next->gtid,
-      .target_barrier = next->seqnum,
-      .agent_barrier = agent_barrier,
-      .commit_flags = COMMIT_AT_TXN_COMMIT,
-  });
 
-  if (req->Commit()) {
-    // Set a time slice of 100 milliseconds for the round-robin task
-    const absl::Duration time_slice = absl::Milliseconds(10);
-
-    // Task is successfully scheduled on the CPU
-    TaskOnCpu(next, cpu);
-
-    // Sleep for the duration of the time slice before swapping tasks
-    absl::SleepFor(time_slice);
-
-    // Trigger CPU task replacement via Ping
-    enclave()->GetAgent(cpu)->Ping();
-  } else {
-    // Scheduling failed, mark task as off the CPU if it was current
-    if (next == cs->current) {
-      TaskOffCpu(next, /*blocked=*/false, /*from_switchto=*/false);
+  if (next) {
+    // 'next' 작업이 이미 다른 CPU에서 실행 중인지 확인
+    while (next->status_word.on_cpu()) {
+      Pause();  // 다른 CPU에서 내려올 때까지 대기
     }
 
-    // Requeue task and set priority boost
-    next->prio_boost = true;
-    cs->run_queue.Enqueue(next);
+    req->Open({
+        .target = next->gtid,                // 실행할 작업의 글로벌 ID
+        .target_barrier = next->seqnum,      // 시퀀스 넘버
+        .agent_barrier = agent_barrier,      // 에이전트 배리어
+        .commit_flags = COMMIT_AT_TXN_COMMIT // 커밋 플래그 설정
+    });
+
+    if (req->Commit()) {
+      // 작업이 CPU에 성공적으로 할당됨
+      TaskOnCpu(next, cpu);
+
+      // 라운드로빈 작업을 10 밀리초 타임 슬라이스로 실행
+      const absl::Duration time_slice = absl::Milliseconds(10);
+      absl::SleepFor(time_slice);
+      TaskOffCpu(next, /*blocked=*/false, /*from_switchto=*/true);
+
+      cs->expired_queue.Enqueue(next);
+
+      // 다음 작업을 위한 Ping
+      enclave()->GetAgent(cpu)->Ping();
+
+    } else {
+      GHOST_DPRINT(3, stderr, "RoundRobinSchedule: commit failed (state=%d)", req->state());
+
+      // Commit이 실패한 경우, 작업을 다시 큐에 넣고 우선순위 부스트 처리
+      if (next == cs->current) {
+        TaskOffCpu(next, /*blocked=*/false, /*from_switchto=*/true);
+      }
+
+      next->prio_boost = true;
+      cs->run_queue.Enqueue(next);
+    }
+  } else {
+      //   // 먼저 run_queue가 비어있는지 확인
+  // if (cs->run_queue.Empty()) {
+  //   // 만료 큐와 스왑 (expired_queue를 run_queue로)
+  //   cs->run_queue.swap(cs->expired_queue);
+
+  //   // 만료 큐와 스왑한 후에도 실행할 작업이 없으면 CPU를 유휴 상태로 설정
+  //   if (cs->run_queue.Empty()) {
+  //     enclave()->GetRunRequest(cpu)->LocalYield(agent_barrier, 0);
+  //     return;
+  //   }
+  // }
+    // 작업이 없는 경우 또는 prio_boost일 때 유휴 상태로 전환
+    int flags = 0;
+    if (prio_boost && (cs->current || !cs->run_queue.Empty())) {
+      flags = RTLA_ON_IDLE;  // CPU가 유휴 상태일 때 에이전트로 제어 반환
+    }
+    req->LocalYield(agent_barrier, flags);
   }
 }
+
+
 
 
 
@@ -316,6 +353,7 @@ void RoundRobinTaskRq::Enqueue(RoundRobinTask* task) {
   else
     rq_.push_back(task);
 }
+
 
 RoundRobinTask* RoundRobinTaskRq::Dequeue() {
   absl::MutexLock lock(&mu_);

@@ -14,8 +14,6 @@
 #include "lib/scheduler.h"
 
 namespace ghost {
-class RoundRobinScheduler;  // 전방 선언
-  struct RoundRobinScheduler::CpuState;  // CpuState의 전방 선언
 
 enum class RoundRobinTaskState {
   kBlocked,   // not on runqueue.
@@ -52,7 +50,6 @@ struct RoundRobinTask : public Task<> {
 
   // Whether the last execution was preempted or not.
   bool preempted = false;
-  int priority = 0;  // 우선순위 필드 추가, 기본값은 0으로 설정
 
   // A task's priority is boosted on a kernel preemption or a !deferrable
   // wakeup - basically when it may be holding locks or other resources
@@ -60,53 +57,31 @@ struct RoundRobinTask : public Task<> {
   bool prio_boost = false;
 };
 
-// class RoundRobinTaskRq {
-//  public:
-//   RoundRobinTaskRq() = default;
-//   RoundRobinTaskRq(const RoundRobinTaskRq&) = delete;
-//   RoundRobinTaskRq& operator=(RoundRobinTaskRq&) = delete;
-
-//   RoundRobinTask* Dequeue();
-//   void Enqueue(RoundRobinTask* task);
-
-//   // Erase 'task' from the runqueue.
-//   //
-//   // Caller must ensure that 'task' is on the runqueue in the first place
-//   // (e.g. via task->queued()).
-//   void Erase(RoundRobinTask* task);
-
-//   size_t Size() const {
-//     absl::MutexLock lock(&mu_);
-//     return rq_.size();
-//   }
-
-//   bool Empty() const { return Size() == 0; }
-
-//  private:
-//   mutable absl::Mutex mu_;
-//   std::deque<RoundRobinTask*> rq_ ABSL_GUARDED_BY(mu_);
-// };
-
-class O1PriorityQueue {
+class RoundRobinTaskRq {
  public:
-  O1PriorityQueue() = default;
-  O1PriorityQueue(const O1PriorityQueue&) = delete;
-  O1PriorityQueue& operator=(O1PriorityQueue&) = delete;
+  RoundRobinTaskRq() = default;
+  RoundRobinTaskRq(const RoundRobinTaskRq&) = delete;
+  RoundRobinTaskRq& operator=(RoundRobinTaskRq&) = delete;
 
-  RoundRobinTask* Dequeue();  // 우선순위가 가장 높은 큐에서 태스크 제거
-  void Enqueue(RoundRobinTask* task);  // 태스크를 적절한 우선순위 큐에 삽입
-  void Erase(RoundRobinTask* task);  // 태스크를 특정 큐에서 제거
-  void SwitchQueuesIfNeeded(RoundRobinScheduler::CpuState* cs);  // CpuState 인스턴스를 전달받음
-  size_t Size() const;  // 전체 큐에 있는 태스크의 총 개수
-  bool Empty() const;  // 모든 큐가 비었는지 여부 확인
-  std::deque<RoundRobinTask*> priority_queues[140];  // 140개의 우선순위 큐
-  // swap 함수 정의
-  friend void swap(O1PriorityQueue& first, O1PriorityQueue& second) {
-    using std::swap;
-    swap(first.priority_queues, second.priority_queues);
+  RoundRobinTask* Dequeue();
+  void Enqueue(RoundRobinTask* task);
+  void swap(RoundRobinTaskRq& other);
+  // Erase 'task' from the runqueue.
+  //
+  // Caller must ensure that 'task' is on the runqueue in the first place
+  // (e.g. via task->queued()).
+  void Erase(RoundRobinTask* task);
+
+  size_t Size() const {
+    absl::MutexLock lock(&mu_);
+    return rq_.size();
   }
+
+  bool Empty() const { return Size() == 0; }
+
  private:
-  mutable absl::Mutex mu_;  // 멀티스레드 환경에서의 동기화를 위해 사용
+  mutable absl::Mutex mu_;
+  std::deque<RoundRobinTask*> rq_ ABSL_GUARDED_BY(mu_);
 };
 
 class RoundRobinScheduler : public BasicDispatchScheduler<RoundRobinTask> {
@@ -122,7 +97,7 @@ class RoundRobinScheduler : public BasicDispatchScheduler<RoundRobinTask> {
 
   bool Empty(const Cpu& cpu) {
     CpuState* cs = cpu_state(cpu);
-    return cs->active_queue.Empty();
+    return cs->run_queue.Empty();
   }
 
   void DumpState(const Cpu& cpu, int flags) final;
@@ -150,10 +125,12 @@ class RoundRobinScheduler : public BasicDispatchScheduler<RoundRobinTask> {
   void TaskPreempted(RoundRobinTask* task, const Message& msg) final;
   void TaskSwitchto(RoundRobinTask* task, const Message& msg) final;
 
- public:
+ private:
   void RoundRobinSchedule(const Cpu& cpu, BarrierToken agent_barrier,
                     bool prio_boosted);
   void TaskOffCpu(RoundRobinTask* task, bool blocked, bool from_switchto);
+  void TaskOffCpuWithExp(RoundRobinTask* task, bool blocked, bool from_switchto);
+
   void TaskOnCpu(RoundRobinTask* task, Cpu cpu);
   void Migrate(RoundRobinTask* task, Cpu cpu, BarrierToken seqnum);
   Cpu AssignCpu(RoundRobinTask* task);
@@ -162,9 +139,9 @@ class RoundRobinScheduler : public BasicDispatchScheduler<RoundRobinTask> {
   struct CpuState {
     RoundRobinTask* current = nullptr;
     std::unique_ptr<Channel> channel = nullptr;
-
-    O1PriorityQueue active_queue;  // 활성 우선순위 큐 (active queue)
-  O1PriorityQueue expired_queue;  // 만료 우선순위 큐 (expired queue)
+    RoundRobinTaskRq run_queue;
+    RoundRobinTaskRq expired_queue;
+    
   } ABSL_CACHELINE_ALIGNED;
 
   inline CpuState* cpu_state(const Cpu& cpu) { return &cpu_states_[cpu.id()]; }
