@@ -238,32 +238,21 @@ void RoundRobinScheduler::RoundRobinSchedule(const Cpu& cpu, BarrierToken agent_
   CpuState* cs = cpu_state(cpu);
   RoundRobinTask* next = nullptr;
   // 우선순위 부스트가 설정되지 않았을 때 현재 작업 또는 다음 작업을 가져옴
-  if (!prio_boost) {
-    next = cs->current;
-    if (!next) {
-      // run_queue가 비어있으면 expired_queue와 스왑
-      if (cs->run_queue.Empty()) {
-        cs->run_queue.swap(cs->expired_queue);
-        
-        GHOST_DPRINT(3, stderr, "swap completed");
+    // 우선순위 부스트가 설정되지 않았을 때 현재 작업 또는 다음 작업을 가져옴
+    if (!prio_boost) {
+        next = cs->current;
+        if (!next) {
+            if (cs->run_queue.Empty() && !cs->expired_queue.Empty()) {
+                cs->run_queue.swap(cs->expired_queue);
 
-        // 스왑 후에도 비어있으면 idle 상태로 전환
-        if (cs->run_queue.Empty()) {
-          enclave()->GetRunRequest(cpu)->LocalYield(agent_barrier, 0);
-          return;
+                if (cs->run_queue.Empty()) {
+                    enclave()->GetRunRequest(cpu)->LocalYield(agent_barrier, 0);
+                    return;
+                }
+            }
+            next = cs->run_queue.Dequeue();
         }
-      }
-
-      // run_queue에서 작업을 가져옴
-      next = cs->run_queue.Dequeue();
-
-      // next가 nullptr인 경우 유휴 상태로 전환
-      if (!next) {
-        enclave()->GetRunRequest(cpu)->LocalYield(agent_barrier, 0);
-        return;
-      }
     }
-  }
 
   GHOST_DPRINT(3, stderr, "RoundRobinSchedule %s on %s cpu %d ",
                next ? next->gtid.describe() : "idling",
@@ -288,7 +277,7 @@ void RoundRobinScheduler::RoundRobinSchedule(const Cpu& cpu, BarrierToken agent_
       // 작업이 CPU에 성공적으로 할당됨
       TaskOnCpu(next, cpu);
 
-      // 라운드로빈 작업을 10 밀리초 타임 슬라이스로 실행
+      // 라운드로빈 작업을 20 밀리초 타임 슬라이스로 실행
       const absl::Duration time_slice = absl::Milliseconds(20);
       absl::SleepFor(time_slice);
       TaskOffCpu(next, /*blocked=*/false, /*from_switchto=*/true);
