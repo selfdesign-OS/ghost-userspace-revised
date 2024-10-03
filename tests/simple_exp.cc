@@ -154,7 +154,7 @@ int main() {
   {
     printf("SimpleExpMany\n");
     ghost::ScopedTime time;
-    ghost::SimpleExpMany(1000);
+    ghost::SimpleExpMany(100);
   }
   {
     printf("BusyExp\n");

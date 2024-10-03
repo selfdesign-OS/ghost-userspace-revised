@@ -217,10 +217,6 @@ void RoundRobinScheduler::TaskOffCpu(RoundRobinTask* task, bool blocked,
       blocked ? RoundRobinTaskState::kBlocked : RoundRobinTaskState::kRunnable;
 }
 void RoundRobinTaskRq::swap(RoundRobinTaskRq& other) {
-    // 뮤텍스를 사용하여 안전하게 교환 (락킹)
-    absl::MutexLock lock_this(&mu_);
-    absl::MutexLock lock_other(&other.mu_);
-
     // 두 대기열(rq_)을 교환
     std::swap(rq_, other.rq_);
 }
@@ -241,11 +237,32 @@ void RoundRobinScheduler::TaskOnCpu(RoundRobinTask* task, Cpu cpu) {
 void RoundRobinScheduler::RoundRobinSchedule(const Cpu& cpu, BarrierToken agent_barrier, bool prio_boost) {
   CpuState* cs = cpu_state(cpu);
   RoundRobinTask* next = nullptr;
-
   // 우선순위 부스트가 설정되지 않았을 때 현재 작업 또는 다음 작업을 가져옴
   if (!prio_boost) {
     next = cs->current;
-    if (!next) next = cs->run_queue.Dequeue();
+    if (!next) {
+      // run_queue가 비어있으면 expired_queue와 스왑
+      if (cs->run_queue.Empty()) {
+        cs->run_queue.swap(cs->expired_queue);
+        
+        GHOST_DPRINT(3, stderr, "swap completed");
+
+        // 스왑 후에도 비어있으면 idle 상태로 전환
+        if (cs->run_queue.Empty()) {
+          enclave()->GetRunRequest(cpu)->LocalYield(agent_barrier, 0);
+          return;
+        }
+      }
+
+      // run_queue에서 작업을 가져옴
+      next = cs->run_queue.Dequeue();
+
+      // next가 nullptr인 경우 유휴 상태로 전환
+      if (!next) {
+        enclave()->GetRunRequest(cpu)->LocalYield(agent_barrier, 0);
+        return;
+      }
+    }
   }
 
   GHOST_DPRINT(3, stderr, "RoundRobinSchedule %s on %s cpu %d ",
@@ -272,10 +289,9 @@ void RoundRobinScheduler::RoundRobinSchedule(const Cpu& cpu, BarrierToken agent_
       TaskOnCpu(next, cpu);
 
       // 라운드로빈 작업을 10 밀리초 타임 슬라이스로 실행
-      const absl::Duration time_slice = absl::Milliseconds(10);
+      const absl::Duration time_slice = absl::Milliseconds(20);
       absl::SleepFor(time_slice);
       TaskOffCpu(next, /*blocked=*/false, /*from_switchto=*/true);
-
       cs->expired_queue.Enqueue(next);
 
       // 다음 작업을 위한 Ping
@@ -293,17 +309,7 @@ void RoundRobinScheduler::RoundRobinSchedule(const Cpu& cpu, BarrierToken agent_
       cs->run_queue.Enqueue(next);
     }
   } else {
-      //   // 먼저 run_queue가 비어있는지 확인
-  // if (cs->run_queue.Empty()) {
-  //   // 만료 큐와 스왑 (expired_queue를 run_queue로)
-  //   cs->run_queue.swap(cs->expired_queue);
 
-  //   // 만료 큐와 스왑한 후에도 실행할 작업이 없으면 CPU를 유휴 상태로 설정
-  //   if (cs->run_queue.Empty()) {
-  //     enclave()->GetRunRequest(cpu)->LocalYield(agent_barrier, 0);
-  //     return;
-  //   }
-  // }
     // 작업이 없는 경우 또는 prio_boost일 때 유휴 상태로 전환
     int flags = 0;
     if (prio_boost && (cs->current || !cs->run_queue.Empty())) {
@@ -312,16 +318,6 @@ void RoundRobinScheduler::RoundRobinSchedule(const Cpu& cpu, BarrierToken agent_
     req->LocalYield(agent_barrier, flags);
   }
 }
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -360,7 +356,6 @@ RoundRobinTask* RoundRobinTaskRq::Dequeue() {
   if (rq_.empty()) return nullptr;
 
   RoundRobinTask* task = rq_.front();
-  CHECK(task->queued());
   task->run_state = RoundRobinTaskState::kRunnable;
   rq_.pop_front();
   return task;
