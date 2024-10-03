@@ -5,30 +5,31 @@
 // https://developers.google.com/open-source/licenses/bsd
 
 #include "schedulers/O-one/O-one_scheduler.h"
-#include "absl/time/time.h"  // 필요 시 absl 시간 라이브러리 포함
 
 #include <memory>
 
 namespace ghost {
 
-RoundRobinScheduler::RoundRobinScheduler(Enclave* enclave, CpuList cpulist,
-                             std::shared_ptr<TaskAllocator<RoundRobinTask>> allocator)
+FifoScheduler::FifoScheduler(Enclave* enclave, CpuList cpulist,
+                             std::shared_ptr<TaskAllocator<FifoTask>> allocator)
     : BasicDispatchScheduler(enclave, std::move(cpulist),
                              std::move(allocator)) {
   for (const Cpu& cpu : cpus()) {
+    // TODO: extend Cpu to get numa node.
     int node = 0;
     CpuState* cs = cpu_state(cpu);
     cs->channel = enclave->MakeChannel(GHOST_MAX_QUEUE_ELEMS, node,
                                        MachineTopology()->ToCpuList({cpu}));
+    // This channel pointer is valid for the lifetime of FifoScheduler
     if (!default_channel_) {
       default_channel_ = cs->channel.get();
     }
   }
 }
 
-void RoundRobinScheduler::DumpAllTasks() {
+void FifoScheduler::DumpAllTasks() {
   fprintf(stderr, "task        state   cpu\n");
-  allocator()->ForEachTask([](Gtid gtid, const RoundRobinTask* task) {
+  allocator()->ForEachTask([](Gtid gtid, const FifoTask* task) {
     absl::FPrintF(stderr, "%-12s%-8d%-8d%c%c\n", gtid.describe(),
                   task->run_state, task->cpu, task->preempted ? 'P' : '-',
                   task->prio_boost ? 'B' : '-');
@@ -36,7 +37,7 @@ void RoundRobinScheduler::DumpAllTasks() {
   });
 }
 
-void RoundRobinScheduler::DumpState(const Cpu& cpu, int flags) {
+void FifoScheduler::DumpState(const Cpu& cpu, int flags) {
   if (flags & Scheduler::kDumpAllTasks) {
     DumpAllTasks();
   }
@@ -47,17 +48,18 @@ void RoundRobinScheduler::DumpState(const Cpu& cpu, int flags) {
     return;
   }
 
-  const RoundRobinTask* current = cs->current;
-  const RoundRobinTaskRq* rq = &cs->run_queue;
+  const FifoTask* current = cs->current;
+  const FifoRq* rq = &cs->run_queue;
   absl::FPrintF(stderr, "SchedState[%d]: %s rq_l=%lu\n", cpu.id(),
                 current ? current->gtid.describe() : "none", rq->Size());
 }
 
-void RoundRobinScheduler::EnclaveReady() {
+void FifoScheduler::EnclaveReady() {
   for (const Cpu& cpu : cpus()) {
     CpuState* cs = cpu_state(cpu);
     Agent* agent = enclave()->GetAgent(cpu);
 
+    // AssociateTask may fail if agent barrier is stale.
     while (!cs->channel->AssociateTask(agent->gtid(), agent->barrier(),
                                        /*status=*/nullptr)) {
       CHECK_EQ(errno, ESTALE);
@@ -65,7 +67,9 @@ void RoundRobinScheduler::EnclaveReady() {
   }
 }
 
-Cpu RoundRobinScheduler::AssignCpu(RoundRobinTask* task) {
+// Implicitly thread-safe because it is only called from one agent associated
+// with the default queue.
+Cpu FifoScheduler::AssignCpu(FifoTask* task) {
   static auto begin = cpus().begin();
   static auto end = cpus().end();
   static auto next = end;
@@ -76,8 +80,8 @@ Cpu RoundRobinScheduler::AssignCpu(RoundRobinTask* task) {
   return next++;
 }
 
-void RoundRobinScheduler::Migrate(RoundRobinTask* task, Cpu cpu, BarrierToken seqnum) {
-  CHECK_EQ(task->run_state, RoundRobinTaskState::kRunnable);
+void FifoScheduler::Migrate(FifoTask* task, Cpu cpu, BarrierToken seqnum) {
+  CHECK_EQ(task->run_state, FifoTaskState::kRunnable);
   CHECK_EQ(task->cpu, -1);
 
   CpuState* cs = cpu_state(cpu);
@@ -88,35 +92,47 @@ void RoundRobinScheduler::Migrate(RoundRobinTask* task, Cpu cpu, BarrierToken se
                cpu.id());
   task->cpu = cpu.id();
 
+  // Make task visible in the new runqueue *after* changing the association
+  // (otherwise the task can get oncpu while producing into the old queue).
   cs->run_queue.Enqueue(task);
 
+  // Get the agent's attention so it notices the new task.
   enclave()->GetAgent(cpu)->Ping();
 }
 
-void RoundRobinScheduler::TaskNew(RoundRobinTask* task, const Message& msg) {
+void FifoScheduler::TaskNew(FifoTask* task, const Message& msg) {
   const ghost_msg_payload_task_new* payload =
       static_cast<const ghost_msg_payload_task_new*>(msg.payload());
 
   task->seqnum = msg.seqnum();
-  task->run_state = RoundRobinTaskState::kBlocked;
+  task->run_state = FifoTaskState::kBlocked;
 
   if (payload->runnable) {
-    task->run_state = RoundRobinTaskState::kRunnable;
+    task->run_state = FifoTaskState::kRunnable;
     Cpu cpu = AssignCpu(task);
     Migrate(task, cpu, msg.seqnum());
+  } else {
+    // Wait until task becomes runnable to avoid race between migration
+    // and MSG_TASK_WAKEUP showing up on the default channel.
   }
 }
 
-void RoundRobinScheduler::TaskRunnable(RoundRobinTask* task, const Message& msg) {
+void FifoScheduler::TaskRunnable(FifoTask* task, const Message& msg) {
   const ghost_msg_payload_task_wakeup* payload =
       static_cast<const ghost_msg_payload_task_wakeup*>(msg.payload());
 
   CHECK(task->blocked());
-  task->run_state = RoundRobinTaskState::kRunnable;
+  task->run_state = FifoTaskState::kRunnable;
 
+  // A non-deferrable wakeup gets the same preference as a preempted task.
+  // This is because it may be holding locks or resources needed by other
+  // tasks to make progress.
   task->prio_boost = !payload->deferrable;
 
   if (task->cpu < 0) {
+    // There cannot be any more messages pending for this task after a
+    // MSG_TASK_WAKEUP (until the agent puts it oncpu) so it's safe to
+    // migrate.
     Cpu cpu = AssignCpu(task);
     Migrate(task, cpu, msg.seqnum());
   } else {
@@ -125,7 +141,7 @@ void RoundRobinScheduler::TaskRunnable(RoundRobinTask* task, const Message& msg)
   }
 }
 
-void RoundRobinScheduler::TaskDeparted(RoundRobinTask* task, const Message& msg) {
+void FifoScheduler::TaskDeparted(FifoTask* task, const Message& msg) {
   const ghost_msg_payload_task_departed* payload =
       static_cast<const ghost_msg_payload_task_departed*>(msg.payload());
 
@@ -146,12 +162,12 @@ void RoundRobinScheduler::TaskDeparted(RoundRobinTask* task, const Message& msg)
   allocator()->FreeTask(task);
 }
 
-void RoundRobinScheduler::TaskDead(RoundRobinTask* task, const Message& msg) {
+void FifoScheduler::TaskDead(FifoTask* task, const Message& msg) {
   CHECK(task->blocked());
   allocator()->FreeTask(task);
 }
 
-void RoundRobinScheduler::TaskYield(RoundRobinTask* task, const Message& msg) {
+void FifoScheduler::TaskYield(FifoTask* task, const Message& msg) {
   const ghost_msg_payload_task_yield* payload =
       static_cast<const ghost_msg_payload_task_yield*>(msg.payload());
 
@@ -166,7 +182,7 @@ void RoundRobinScheduler::TaskYield(RoundRobinTask* task, const Message& msg) {
   }
 }
 
-void RoundRobinScheduler::TaskBlocked(RoundRobinTask* task, const Message& msg) {
+void FifoScheduler::TaskBlocked(FifoTask* task, const Message& msg) {
   const ghost_msg_payload_task_blocked* payload =
       static_cast<const ghost_msg_payload_task_blocked*>(msg.payload());
 
@@ -178,7 +194,7 @@ void RoundRobinScheduler::TaskBlocked(RoundRobinTask* task, const Message& msg) 
   }
 }
 
-void RoundRobinScheduler::TaskPreempted(RoundRobinTask* task, const Message& msg) {
+void FifoScheduler::TaskPreempted(FifoTask* task, const Message& msg) {
   const ghost_msg_payload_task_preempt* payload =
       static_cast<const ghost_msg_payload_task_preempt*>(msg.payload());
 
@@ -195,11 +211,12 @@ void RoundRobinScheduler::TaskPreempted(RoundRobinTask* task, const Message& msg
   }
 }
 
-void RoundRobinScheduler::TaskSwitchto(RoundRobinTask* task, const Message& msg) {
+void FifoScheduler::TaskSwitchto(FifoTask* task, const Message& msg) {
   TaskOffCpu(task, /*blocked=*/true, /*from_switchto=*/false);
 }
 
-void RoundRobinScheduler::TaskOffCpu(RoundRobinTask* task, bool blocked,
+
+void FifoScheduler::TaskOffCpu(FifoTask* task, bool blocked,
                                bool from_switchto) {
   GHOST_DPRINT(3, stderr, "Task %s offcpu %d", task->gtid.describe(),
                task->cpu);
@@ -209,108 +226,98 @@ void RoundRobinScheduler::TaskOffCpu(RoundRobinTask* task, bool blocked,
     CHECK_EQ(cs->current, task);
     cs->current = nullptr;
   } else {
-    // CHECK(from_switchto);
-    // CHECK_EQ(task->run_state, RoundRobinTaskState::kBlocked);
+    CHECK(from_switchto);
+    CHECK_EQ(task->run_state, FifoTaskState::kBlocked);
   }
 
   task->run_state =
-      blocked ? RoundRobinTaskState::kBlocked : RoundRobinTaskState::kRunnable;
+      blocked ? FifoTaskState::kBlocked : FifoTaskState::kRunnable;
 }
-void RoundRobinTaskRq::swap(RoundRobinTaskRq& other) {
-    // 두 대기열(rq_)을 교환
-    std::swap(rq_, other.rq_);
-}
-void RoundRobinScheduler::TaskOnCpu(RoundRobinTask* task, Cpu cpu) {
+
+void FifoScheduler::TaskOnCpu(FifoTask* task, Cpu cpu) {
   CpuState* cs = cpu_state(cpu);
   cs->current = task;
 
-  GHOST_DPRINT(1, stderr, "Task %s oncpu %d", task->gtid.describe(), cpu.id());
+  GHOST_DPRINT(3, stderr, "Task %s oncpu %d", task->gtid.describe(), cpu.id());
 
-  task->run_state = RoundRobinTaskState::kOnCpu;
+  task->run_state = FifoTaskState::kOnCpu;
   task->cpu = cpu.id();
   task->preempted = false;
   task->prio_boost = false;
 }
+void FifoRq::swap(FifoRq& other){
+  std::swap(this->rq_, other.rq_);
+}
 
-
-
-void RoundRobinScheduler::RoundRobinSchedule(const Cpu& cpu, BarrierToken agent_barrier, bool prio_boost) {
+void FifoScheduler::FifoSchedule(const Cpu& cpu, BarrierToken agent_barrier,
+                                 bool prio_boost) {
   CpuState* cs = cpu_state(cpu);
-  RoundRobinTask* next = nullptr;
-  // 우선순위 부스트가 설정되지 않았을 때 현재 작업 또는 다음 작업을 가져옴
-    // 우선순위 부스트가 설정되지 않았을 때 현재 작업 또는 다음 작업을 가져옴
-    if (!prio_boost) {
-        next = cs->current;
-        if (!next) {
-            if (cs->run_queue.Empty() && !cs->expired_queue.Empty()) {
-                cs->run_queue.swap(cs->expired_queue);
-
-                if (cs->run_queue.Empty()) {
-                    enclave()->GetRunRequest(cpu)->LocalYield(agent_barrier, 0);
-                    return;
-                }
-            }
-            next = cs->run_queue.Dequeue();
-        }
+  FifoTask* next = nullptr;
+  if (!prio_boost) {
+    next = cs->current;
+    if (!next) {
+      if(cs->run_queue.Empty()&&!cs->expired_queue.Empty()){
+          cs->run_queue.swap(cs->expired_queue);
+      }
+      next = cs->run_queue.Dequeue();
     }
+  }
 
-  GHOST_DPRINT(3, stderr, "RoundRobinSchedule %s on %s cpu %d ",
+  GHOST_DPRINT(3, stderr, "FifoSchedule %s on %s cpu %d ",
                next ? next->gtid.describe() : "idling",
                prio_boost ? "prio-boosted" : "", cpu.id());
 
   RunRequest* req = enclave()->GetRunRequest(cpu);
-
   if (next) {
-    // 'next' 작업이 이미 다른 CPU에서 실행 중인지 확인
+    // Wait for 'next' to get offcpu before switching to it. This might seem
+    // superfluous because we don't migrate tasks past the initial assignment
+    // of the task to a cpu. However a SwitchTo target can migrate and run on
+    // another CPU behind the agent's back. This is usually undetectable from
+    // the agent's pov since the SwitchTo target is blocked and thus !on_rq.
+    //
+    // However if 'next' happens to be the last task in a SwitchTo chain then
+    // it is possible to process TASK_WAKEUP(next) before it has gotten off
+    // the remote cpu. The 'on_cpu()' check below handles this scenario.
+    //
+    // See go/switchto-ghost for more details.
     while (next->status_word.on_cpu()) {
-      Pause();  // 다른 CPU에서 내려올 때까지 대기
+      Pause();
     }
 
     req->Open({
-        .target = next->gtid,                // 실행할 작업의 글로벌 ID
-        .target_barrier = next->seqnum,      // 시퀀스 넘버
-        .agent_barrier = agent_barrier,      // 에이전트 배리어
-        .commit_flags = COMMIT_AT_TXN_COMMIT // 커밋 플래그 설정
+        .target = next->gtid,
+        .target_barrier = next->seqnum,
+        .agent_barrier = agent_barrier,
+        .commit_flags = COMMIT_AT_TXN_COMMIT,
     });
 
     if (req->Commit()) {
-      // 작업이 CPU에 성공적으로 할당됨
+      // Txn commit succeeded and 'next' is oncpu.
       TaskOnCpu(next, cpu);
-
-      // 라운드로빈 작업을 20 밀리초 타임 슬라이스로 실행
-      const absl::Duration time_slice = absl::Milliseconds(20);
-      absl::SleepFor(time_slice);
-      TaskOffCpu(next, /*blocked=*/false, /*from_switchto=*/true);
-      cs->expired_queue.Enqueue(next);
-
-      // 다음 작업을 위한 Ping
-      enclave()->GetAgent(cpu)->Ping();
-
     } else {
-      GHOST_DPRINT(3, stderr, "RoundRobinSchedule: commit failed (state=%d)", req->state());
+      GHOST_DPRINT(3, stderr, "FifoSchedule: commit failed (state=%d)",
+                   req->state());
 
-      // Commit이 실패한 경우, 작업을 다시 큐에 넣고 우선순위 부스트 처리
       if (next == cs->current) {
-        TaskOffCpu(next, /*blocked=*/false, /*from_switchto=*/true);
+        TaskOffCpu(next, /*blocked=*/false, /*from_switchto=*/false);
       }
 
+      // Txn commit failed so push 'next' to the front of runqueue.
       next->prio_boost = true;
       cs->run_queue.Enqueue(next);
     }
   } else {
-
-    // 작업이 없는 경우 또는 prio_boost일 때 유휴 상태로 전환
+    // If LocalYield is due to 'prio_boost' then instruct the kernel to
+    // return control back to the agent when CPU is idle.
     int flags = 0;
     if (prio_boost && (cs->current || !cs->run_queue.Empty())) {
-      flags = RTLA_ON_IDLE;  // CPU가 유휴 상태일 때 에이전트로 제어 반환
+      flags = RTLA_ON_IDLE;
     }
     req->LocalYield(agent_barrier, flags);
   }
 }
 
-
-
-void RoundRobinScheduler::Schedule(const Cpu& cpu, const StatusWord& agent_sw) {
+void FifoScheduler::Schedule(const Cpu& cpu, const StatusWord& agent_sw) {
   BarrierToken agent_barrier = agent_sw.barrier();
   CpuState* cs = cpu_state(cpu);
 
@@ -323,14 +330,14 @@ void RoundRobinScheduler::Schedule(const Cpu& cpu, const StatusWord& agent_sw) {
     Consume(cs->channel.get(), msg);
   }
 
-  RoundRobinSchedule(cpu, agent_barrier, agent_sw.boosted_priority());
+  FifoSchedule(cpu, agent_barrier, agent_sw.boosted_priority());
 }
 
-void RoundRobinTaskRq::Enqueue(RoundRobinTask* task) {
+void FifoRq::Enqueue(FifoTask* task) {
   CHECK_GE(task->cpu, 0);
-  CHECK_EQ(task->run_state, RoundRobinTaskState::kRunnable);
+  CHECK_EQ(task->run_state, FifoTaskState::kRunnable);
 
-  task->run_state = RoundRobinTaskState::kQueued;
+  task->run_state = FifoTaskState::kQueued;
 
   absl::MutexLock lock(&mu_);
   if (task->prio_boost)
@@ -339,33 +346,35 @@ void RoundRobinTaskRq::Enqueue(RoundRobinTask* task) {
     rq_.push_back(task);
 }
 
-
-RoundRobinTask* RoundRobinTaskRq::Dequeue() {
+FifoTask* FifoRq::Dequeue() {
   absl::MutexLock lock(&mu_);
   if (rq_.empty()) return nullptr;
 
-  RoundRobinTask* task = rq_.front();
-  task->run_state = RoundRobinTaskState::kRunnable;
+  FifoTask* task = rq_.front();
+  CHECK(task->queued());
+  task->run_state = FifoTaskState::kRunnable;
   rq_.pop_front();
   return task;
 }
 
-void RoundRobinTaskRq::Erase(RoundRobinTask* task) {
-  CHECK_EQ(task->run_state, RoundRobinTaskState::kQueued);
+void FifoRq::Erase(FifoTask* task) {
+  CHECK_EQ(task->run_state, FifoTaskState::kQueued);
   absl::MutexLock lock(&mu_);
   size_t size = rq_.size();
   if (size > 0) {
+    // Check if 'task' is at the back of the runqueue (common case).
     size_t pos = size - 1;
     if (rq_[pos] == task) {
       rq_.erase(rq_.cbegin() + pos);
-      task->run_state = RoundRobinTaskState::kRunnable;
+      task->run_state = FifoTaskState::kRunnable;
       return;
     }
 
+    // Now search for 'task' from the beginning of the runqueue.
     for (pos = 0; pos < size - 1; pos++) {
       if (rq_[pos] == task) {
         rq_.erase(rq_.cbegin() + pos);
-        task->run_state =  RoundRobinTaskState::kRunnable;
+        task->run_state =  FifoTaskState::kRunnable;
         return;
       }
     }
@@ -373,15 +382,15 @@ void RoundRobinTaskRq::Erase(RoundRobinTask* task) {
   CHECK(false);
 }
 
-std::unique_ptr<RoundRobinScheduler> MultiThreadedRRScheduler(Enclave* enclave,
+std::unique_ptr<FifoScheduler> MultiThreadedFifoScheduler(Enclave* enclave,
                                                           CpuList cpulist) {
-  auto allocator = std::make_shared<ThreadSafeMallocTaskAllocator<RoundRobinTask>>();
-  auto scheduler = std::make_unique<RoundRobinScheduler>(enclave, std::move(cpulist),
+  auto allocator = std::make_shared<ThreadSafeMallocTaskAllocator<FifoTask>>();
+  auto scheduler = std::make_unique<FifoScheduler>(enclave, std::move(cpulist),
                                                    std::move(allocator));
   return scheduler;
 }
 
-void RoundRobinAgent::AgentThread() {
+void FifoAgent::AgentThread() {
   gtid().assign_name("Agent:" + std::to_string(cpu().id()));
   if (verbose() > 1) {
     printf("Agent tid:=%d\n", gtid().tid());
@@ -406,18 +415,16 @@ void RoundRobinAgent::AgentThread() {
   }
 }
 
-std::ostream& operator<<(std::ostream& os, const RoundRobinTaskState& state) {
+std::ostream& operator<<(std::ostream& os, const FifoTaskState& state) {
   switch (state) {
-    case RoundRobinTaskState::kBlocked:
+    case FifoTaskState::kBlocked:
       return os << "kBlocked";
-    case RoundRobinTaskState::kRunnable:
+    case FifoTaskState::kRunnable:
       return os << "kRunnable";
-    case RoundRobinTaskState::kQueued:
+    case FifoTaskState::kQueued:
       return os << "kQueued";
-    case RoundRobinTaskState::kOnCpu:
+    case FifoTaskState::kOnCpu:
       return os << "kOnCpu";
-      default:
-      return os << "UnknownState";  // Handle any unexpected cases
   }
 }
 

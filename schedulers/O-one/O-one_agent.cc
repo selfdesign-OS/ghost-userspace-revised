@@ -12,7 +12,7 @@
 #include "absl/flags/parse.h"
 #include "lib/agent.h"
 #include "lib/enclave.h"
-#include "schedulers/O-one/O-one_scheduler.h"
+#include "schedulers/fifo/per_cpu/fifo_scheduler.h"
 
 ABSL_FLAG(std::string, ghost_cpus, "1-5", "cpulist");
 ABSL_FLAG(std::string, enclave, "", "Connect to preexisting enclave directory");
@@ -47,7 +47,7 @@ int main(int argc, char* argv[]) {
   printf("Initializing...\n");
 
   // Using new so we can destruct the object before printing Done
-  auto uap = new ghost::AgentProcess<ghost::FullRoundRobinAgent<ghost::LocalEnclave>,  // Round Robin Agent 사용
+  auto uap = new ghost::AgentProcess<ghost::FullFifoAgent<ghost::LocalEnclave>,
                                      ghost::AgentConfig>(config);
 
   ghost::GhostHelper()->InitCore();
@@ -73,7 +73,7 @@ int main(int argc, char* argv[]) {
 
   // TODO: this is racy - uap could be deleted already
   ghost::GhostSignals::AddHandler(SIGUSR1, [uap](int) {
-    uap->Rpc(ghost::RoundRobinScheduler::kDebugRunqueue);  // Round Robin 스케줄러 사용
+    uap->Rpc(ghost::FifoScheduler::kDebugRunqueue);
     return false;
   });
 
