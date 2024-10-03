@@ -264,20 +264,19 @@ void FifoScheduler::FifoSchedule(const Cpu& cpu, BarrierToken agent_barrier, boo
     CpuState* cs = cpu_state(cpu);
     FifoTask* next = nullptr;
 
-    if (prio_boost) {
-        // prio_boost가 true이면 우선순위가 높은 작업을 선택
-        if (!cs->run_queue.Empty()) {
-            next = cs->run_queue.Dequeue();
-        }
-    } else {
+    if (true) {
         // 시간 슬라이스를 확인하고 작업을 선택
         next = cs->current;
         if (next) {
             uint64_t current_runtime = next->status_word.runtime();
             uint64_t elapsed_time_ns = current_runtime - next->runtime_at_first_pick_ns;
-            if (absl::Nanoseconds(elapsed_time_ns) >= absl::Milliseconds(10)) {
+            GHOST_DPRINT(1, stderr, "\nelapsed_time_ns:%d",elapsed_time_ns);
+
+            if (absl::Nanoseconds(elapsed_time_ns) >= absl::Milliseconds(50)) {
                 // 시간이 초과되면 expired_queue로 이동
                 TaskOffCpu(next, /*blocked=*/false, /*from_switchto=*/false);
+                GHOST_DPRINT(1, stderr, "\nexpired queue enqueued completed");
+
                 cs->expired_queue.Enqueue(next);
                 next = nullptr;
             }
@@ -285,6 +284,7 @@ void FifoScheduler::FifoSchedule(const Cpu& cpu, BarrierToken agent_barrier, boo
 
         if (!next) {
             if (cs->run_queue.Empty() && !cs->expired_queue.Empty()) {
+                  GHOST_DPRINT(1, stderr, "\nswap completed");
                 cs->run_queue.swap(cs->expired_queue);
             }
             next = cs->run_queue.Dequeue();
@@ -318,7 +318,11 @@ void FifoScheduler::FifoSchedule(const Cpu& cpu, BarrierToken agent_barrier, boo
             cs->run_queue.Enqueue(next);
         }
     } else {
-        req->LocalYield(agent_barrier, 0);
+    int flags = 0;
+    if (prio_boost && (cs->current || !cs->run_queue.Empty())) {
+      flags = RTLA_ON_IDLE;
+    }
+    req->LocalYield(agent_barrier, flags);
     }
 }
 
