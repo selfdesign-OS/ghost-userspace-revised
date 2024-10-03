@@ -55,6 +55,8 @@ struct FifoTask : public Task<> {
   // wakeup - basically when it may be holding locks or other resources
   // that prevent other tasks from making progress.
   bool prio_boost = false;
+  uint64_t runtime_at_first_pick_ns = 0; // 작업 실행 시작 시간
+
 };
 
 class FifoRq {

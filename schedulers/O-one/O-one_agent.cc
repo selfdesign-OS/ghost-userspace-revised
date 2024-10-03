@@ -12,7 +12,7 @@
 #include "absl/flags/parse.h"
 #include "lib/agent.h"
 #include "lib/enclave.h"
-#include "schedulers/fifo/per_cpu/fifo_scheduler.h"
+#include "schedulers/O-one/O-one_scheduler.h"
 
 ABSL_FLAG(std::string, ghost_cpus, "1-5", "cpulist");
 ABSL_FLAG(std::string, enclave, "", "Connect to preexisting enclave directory");

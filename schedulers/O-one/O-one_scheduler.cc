@@ -244,78 +244,85 @@ void FifoScheduler::TaskOnCpu(FifoTask* task, Cpu cpu) {
   task->cpu = cpu.id();
   task->preempted = false;
   task->prio_boost = false;
+  task->runtime_at_first_pick_ns = task->status_word.runtime();
+
 }
-void FifoRq::swap(FifoRq& other){
-  std::swap(this->rq_, other.rq_);
+void FifoRq::swap(FifoRq& other) {
+    // To prevent deadlocks, always lock the mutexes in the same order.
+    // For example, lock the mutex with the lower memory address first.
+    FifoRq* first = this < &other ? this : &other;
+    FifoRq* second = this < &other ? &other : this;
+
+    absl::MutexLock lock1(&first->mu_);
+    absl::MutexLock lock2(&second->mu_);
+
+    std::swap(this->rq_, other.rq_);
 }
 
-void FifoScheduler::FifoSchedule(const Cpu& cpu, BarrierToken agent_barrier,
-                                 bool prio_boost) {
-  CpuState* cs = cpu_state(cpu);
-  FifoTask* next = nullptr;
-  if (!prio_boost) {
-    next = cs->current;
-    if (!next) {
-      if(cs->run_queue.Empty()&&!cs->expired_queue.Empty()){
-          cs->run_queue.swap(cs->expired_queue);
-      }
-      next = cs->run_queue.Dequeue();
-    }
-  }
 
-  GHOST_DPRINT(3, stderr, "FifoSchedule %s on %s cpu %d ",
-               next ? next->gtid.describe() : "idling",
-               prio_boost ? "prio-boosted" : "", cpu.id());
+void FifoScheduler::FifoSchedule(const Cpu& cpu, BarrierToken agent_barrier, bool prio_boost) {
+    CpuState* cs = cpu_state(cpu);
+    FifoTask* next = nullptr;
 
-  RunRequest* req = enclave()->GetRunRequest(cpu);
-  if (next) {
-    // Wait for 'next' to get offcpu before switching to it. This might seem
-    // superfluous because we don't migrate tasks past the initial assignment
-    // of the task to a cpu. However a SwitchTo target can migrate and run on
-    // another CPU behind the agent's back. This is usually undetectable from
-    // the agent's pov since the SwitchTo target is blocked and thus !on_rq.
-    //
-    // However if 'next' happens to be the last task in a SwitchTo chain then
-    // it is possible to process TASK_WAKEUP(next) before it has gotten off
-    // the remote cpu. The 'on_cpu()' check below handles this scenario.
-    //
-    // See go/switchto-ghost for more details.
-    while (next->status_word.on_cpu()) {
-      Pause();
-    }
-
-    req->Open({
-        .target = next->gtid,
-        .target_barrier = next->seqnum,
-        .agent_barrier = agent_barrier,
-        .commit_flags = COMMIT_AT_TXN_COMMIT,
-    });
-
-    if (req->Commit()) {
-      // Txn commit succeeded and 'next' is oncpu.
-      TaskOnCpu(next, cpu);
+    if (prio_boost) {
+        // prio_boost가 true이면 우선순위가 높은 작업을 선택
+        if (!cs->run_queue.Empty()) {
+            next = cs->run_queue.Dequeue();
+        }
     } else {
-      GHOST_DPRINT(3, stderr, "FifoSchedule: commit failed (state=%d)",
-                   req->state());
+        // 시간 슬라이스를 확인하고 작업을 선택
+        next = cs->current;
+        if (next) {
+            uint64_t current_runtime = next->status_word.runtime();
+            uint64_t elapsed_time_ns = current_runtime - next->runtime_at_first_pick_ns;
+            if (absl::Nanoseconds(elapsed_time_ns) >= absl::Milliseconds(10)) {
+                // 시간이 초과되면 expired_queue로 이동
+                TaskOffCpu(next, /*blocked=*/false, /*from_switchto=*/false);
+                cs->expired_queue.Enqueue(next);
+                next = nullptr;
+            }
+        }
 
-      if (next == cs->current) {
-        TaskOffCpu(next, /*blocked=*/false, /*from_switchto=*/false);
-      }
+        if (!next) {
+            if (cs->run_queue.Empty() && !cs->expired_queue.Empty()) {
+                cs->run_queue.swap(cs->expired_queue);
+            }
+            next = cs->run_queue.Dequeue();
+        }
+    }
 
-      // Txn commit failed so push 'next' to the front of runqueue.
-      next->prio_boost = true;
-      cs->run_queue.Enqueue(next);
+    // 이후 코드 동일하게 유지
+    GHOST_DPRINT(3, stderr, "FifoSchedule %s on %s cpu %d ",
+                 next ? next->gtid.describe() : "idling",
+                 prio_boost ? "prio-boosted" : "", cpu.id());
+
+    RunRequest* req = enclave()->GetRunRequest(cpu);
+    if (next) {
+        while (next->status_word.on_cpu()) {
+            Pause();
+        }
+
+        req->Open({
+            .target = next->gtid,
+            .target_barrier = next->seqnum,
+            .agent_barrier = agent_barrier,
+            .commit_flags = COMMIT_AT_TXN_COMMIT,
+        });
+
+        if (req->Commit()) {
+            GHOST_DPRINT(3, stderr, "Task %s oncpu %d", next->gtid.describe(), cpu.id());
+            TaskOnCpu(next, cpu);
+        } else {
+            GHOST_DPRINT(3, stderr, "FifoSchedule: commit failed (state=%d)", req->state());
+            next->prio_boost = true;
+            cs->run_queue.Enqueue(next);
+        }
+    } else {
+        req->LocalYield(agent_barrier, 0);
     }
-  } else {
-    // If LocalYield is due to 'prio_boost' then instruct the kernel to
-    // return control back to the agent when CPU is idle.
-    int flags = 0;
-    if (prio_boost && (cs->current || !cs->run_queue.Empty())) {
-      flags = RTLA_ON_IDLE;
-    }
-    req->LocalYield(agent_barrier, flags);
-  }
 }
+
+
 
 void FifoScheduler::Schedule(const Cpu& cpu, const StatusWord& agent_sw) {
   BarrierToken agent_barrier = agent_sw.barrier();
