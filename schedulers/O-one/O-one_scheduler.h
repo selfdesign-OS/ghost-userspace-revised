@@ -127,6 +127,8 @@ class FifoScheduler : public BasicDispatchScheduler<FifoTask> {
   void TaskBlocked(FifoTask* task, const Message& msg) final;
   void TaskPreempted(FifoTask* task, const Message& msg) final;
   void TaskSwitchto(FifoTask* task, const Message& msg) final;
+  void CpuTick(const Message& msg);
+  void CheckPreemptTick(const Cpu& cpu);
 
  private:
   void FifoSchedule(const Cpu& cpu, BarrierToken agent_barrier,
@@ -142,6 +144,7 @@ class FifoScheduler : public BasicDispatchScheduler<FifoTask> {
     std::unique_ptr<Channel> channel = nullptr;
     FifoRq run_queue;
     FifoRq expired_queue;
+    bool preempt_curr = false;
 
   } ABSL_CACHELINE_ALIGNED;
 

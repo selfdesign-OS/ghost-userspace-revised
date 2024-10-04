@@ -25,9 +25,7 @@ FifoScheduler::FifoScheduler(Enclave* enclave, CpuList cpulist,
       default_channel_ = cs->channel.get();
     }
       // CPU Tick 메시지 수신을 위해 각 CPU의 채널을 설정합니다.
-    cs->tick_config = enclave_->GetDefaultTickConfig();
   }
-    enclave_->SetDeliverTicks(true);
 
 }
 
@@ -75,22 +73,23 @@ void FifoScheduler::EnclaveReady() {
 void FifoScheduler::CpuTick(const Message& msg) {
   Cpu cpu = topology()->cpu(msg.cpu());
   CpuState* cs = cpu_state(cpu);
-  absl::MutexLock l(&cs->mutex);  // 필요 시 뮤텍스 잠금
+  cs->run_queue.mu_.AssertHeld();
+  CheckPreemptTick(cpu);
+
+}
+void FifoScheduler::CheckPreemptTick(const Cpu& cpu) {
+  CpuState* cs = cpu_state(cpu);
+  // 필요하다면 뮤텍스 잠금 (스레드 안전성을 위해)
+  // cs->run_queue.mu_.AssertHeld();
 
   if (cs->current) {
-    FifoTask* task = cs->current;
-    uint64_t current_runtime = task->status_word.runtime();
-    uint64_t elapsed_time_ns = current_runtime - task->runtime_at_first_pick_ns;
+    FifoTask* current_task = cs->current;
+    uint64_t runtime = current_task->status_word.runtime();
+    uint64_t elapsed_time_ns = runtime - current_task->runtime_at_first_pick_ns;
 
-    // 20ms를 초과했는지 확인
+    // 시간 슬라이스(예: 20ms)를 초과했는지 확인
     if (absl::Nanoseconds(elapsed_time_ns) >= absl::Milliseconds(20)) {
-      // 시간 초과 처리: 태스크를 expired_queue로 이동
-      TaskOffCpu(task, /*blocked=*/false, /*from_switchto=*/false);
-      CpuState* cs = cpu_state_of(task);
-      cs->expired_queue.Enqueue(task);
-      cs->current = nullptr;
-
-      // 다음 스케줄링 시 새로운 태스크를 선택하도록 합니다.
+      cs->preempt_curr = true;
     }
   }
 }
@@ -296,66 +295,58 @@ void FifoRq::swap(FifoRq& other) {
 
 
 void FifoScheduler::FifoSchedule(const Cpu& cpu, BarrierToken agent_barrier, bool prio_boost) {
-    CpuState* cs = cpu_state(cpu);
-    FifoTask* next = nullptr;
+  CpuState* cs = cpu_state(cpu);
+  FifoTask* next = cs->current;
 
-    if (prio_boost) {
-        // prio_boost가 true이면 우선순위가 높은 작업을 선택
-        if (!cs->run_queue.Empty()) {
-            next = cs->run_queue.Dequeue();
-        }
-    } else {
-        // 시간 슬라이스를 확인하고 작업을 선택
-        next = cs->current;
-        if (next) {
-            uint64_t current_runtime = next->status_word.runtime();
-            uint64_t elapsed_time_ns = current_runtime - next->runtime_at_first_pick_ns;
-            if (absl::Nanoseconds(elapsed_time_ns) >= absl::Milliseconds(10)) {
-                // 시간이 초과되면 expired_queue로 이동
-                TaskOffCpu(next, /*blocked=*/false, /*from_switchto=*/false);
-                cs->expired_queue.Enqueue(next);
-                next = nullptr;
-            }
-        }
-
-        if (!next) {
-            if (cs->run_queue.Empty() && !cs->expired_queue.Empty()) {
-                cs->run_queue.swap(cs->expired_queue);
-            }
-            next = cs->run_queue.Dequeue();
-        }
-    }
-
-    // 이후 코드 동일하게 유지
-    GHOST_DPRINT(3, stderr, "FifoSchedule %s on %s cpu %d ",
-                 next ? next->gtid.describe() : "idling",
-                 prio_boost ? "prio-boosted" : "", cpu.id());
-
-    RunRequest* req = enclave()->GetRunRequest(cpu);
+  // 선점이 필요한 경우 처리
+  if (cs->preempt_curr) {
     if (next) {
-        while (next->status_word.on_cpu()) {
-            Pause();
-        }
-
-        req->Open({
-            .target = next->gtid,
-            .target_barrier = next->seqnum,
-            .agent_barrier = agent_barrier,
-            .commit_flags = COMMIT_AT_TXN_COMMIT,
-        });
-
-        if (req->Commit()) {
-            GHOST_DPRINT(3, stderr, "Task %s oncpu %d", next->gtid.describe(), cpu.id());
-            TaskOnCpu(next, cpu);
-        } else {
-            GHOST_DPRINT(3, stderr, "FifoSchedule: commit failed (state=%d)", req->state());
-            next->prio_boost = true;
-            cs->run_queue.Enqueue(next);
-        }
-    } else {
-        req->LocalYield(agent_barrier, 0);
+      // 현재 태스크를 expired_queue로 이동
+      TaskOffCpu(next, /*blocked=*/false, /*from_switchto=*/false);
+      cs->expired_queue.Enqueue(next);
+      cs->current = nullptr;
+      next = nullptr;
     }
+    cs->preempt_curr = false;  // 선점 플래그 초기화
+  }
+
+  if (!next) {
+    if (cs->run_queue.Empty() && !cs->expired_queue.Empty()) {
+      cs->run_queue.swap(cs->expired_queue);
+    }
+    next = cs->run_queue.Dequeue();
+  }
+
+  GHOST_DPRINT(3, stderr, "FifoSchedule %s on cpu %d ",
+               next ? next->gtid.describe() : "idling",
+               cpu.id());
+
+  RunRequest* req = enclave()->GetRunRequest(cpu);
+  if (next) {
+    while (next->status_word.on_cpu()) {
+      Pause();
+    }
+
+    req->Open({
+        .target = next->gtid,
+        .target_barrier = next->seqnum,
+        .agent_barrier = agent_barrier,
+        .commit_flags = COMMIT_AT_TXN_COMMIT,
+    });
+
+    if (req->Commit()) {
+      GHOST_DPRINT(3, stderr, "Task %s oncpu %d", next->gtid.describe(), cpu.id());
+      TaskOnCpu(next, cpu);
+    } else {
+      GHOST_DPRINT(3, stderr, "FifoSchedule: commit failed (state=%d)", req->state());
+      // Commit 실패 시 태스크를 다시 run_queue에 추가
+      cs->run_queue.Enqueue(next);
+    }
+  } else {
+    req->LocalYield(agent_barrier, 0);
+  }
 }
+
 
 
 
