@@ -24,7 +24,11 @@ FifoScheduler::FifoScheduler(Enclave* enclave, CpuList cpulist,
     if (!default_channel_) {
       default_channel_ = cs->channel.get();
     }
+      // CPU Tick 메시지 수신을 위해 각 CPU의 채널을 설정합니다.
+    cs->tick_config = enclave_->GetDefaultTickConfig();
   }
+    enclave_->SetDeliverTicks(true);
+
 }
 
 void FifoScheduler::DumpAllTasks() {
@@ -63,6 +67,30 @@ void FifoScheduler::EnclaveReady() {
     while (!cs->channel->AssociateTask(agent->gtid(), agent->barrier(),
                                        /*status=*/nullptr)) {
       CHECK_EQ(errno, ESTALE);
+    }
+  }
+  enclave()->SetDeliverTicks(true);
+
+}
+void FifoScheduler::CpuTick(const Message& msg) {
+  Cpu cpu = topology()->cpu(msg.cpu());
+  CpuState* cs = cpu_state(cpu);
+  absl::MutexLock l(&cs->mutex);  // 필요 시 뮤텍스 잠금
+
+  if (cs->current) {
+    FifoTask* task = cs->current;
+    uint64_t current_runtime = task->status_word.runtime();
+    uint64_t elapsed_time_ns = current_runtime - task->runtime_at_first_pick_ns;
+
+    // 20ms를 초과했는지 확인
+    if (absl::Nanoseconds(elapsed_time_ns) >= absl::Milliseconds(20)) {
+      // 시간 초과 처리: 태스크를 expired_queue로 이동
+      TaskOffCpu(task, /*blocked=*/false, /*from_switchto=*/false);
+      CpuState* cs = cpu_state_of(task);
+      cs->expired_queue.Enqueue(task);
+      cs->current = nullptr;
+
+      // 다음 스케줄링 시 새로운 태스크를 선택하도록 합니다.
     }
   }
 }
@@ -232,6 +260,10 @@ void FifoScheduler::TaskOffCpu(FifoTask* task, bool blocked,
 
   task->run_state =
       blocked ? FifoTaskState::kBlocked : FifoTaskState::kRunnable;
+  // 태스크가 블록된 경우 runtime_at_first_pick_ns를 초기화하도록 설정
+  if (blocked) {
+    task->reset_runtime = true;
+  }
 }
 
 void FifoScheduler::TaskOnCpu(FifoTask* task, Cpu cpu) {
@@ -244,8 +276,11 @@ void FifoScheduler::TaskOnCpu(FifoTask* task, Cpu cpu) {
   task->cpu = cpu.id();
   task->preempted = false;
   task->prio_boost = false;
-  task->runtime_at_first_pick_ns = task->status_word.runtime();
-
+  // runtime_at_first_pick_ns를 현재 누적 실행 시간으로 설정
+  if (task->reset_runtime) {
+    task->runtime_at_first_pick_ns = task->status_word.runtime();
+    task->reset_runtime = false;
+  }
 }
 void FifoRq::swap(FifoRq& other) {
     // To prevent deadlocks, always lock the mutexes in the same order.
