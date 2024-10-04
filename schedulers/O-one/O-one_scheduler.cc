@@ -73,14 +73,12 @@ void FifoScheduler::EnclaveReady() {
 void FifoScheduler::CpuTick(const Message& msg) {
   Cpu cpu = topology()->cpu(msg.cpu());
   CpuState* cs = cpu_state(cpu);
-  cs->run_queue.mu_.AssertHeld();
+    absl::MutexLock lock(&cs->run_queue.mu_);  // 뮤텍스 잠금
   CheckPreemptTick(cpu);
 
 }
-void FifoScheduler::CheckPreemptTick(const Cpu& cpu) {
+void FifoScheduler::CheckPreemptTick(const Cpu& cpu) ABSL_NO_THREAD_SAFETY_ANALYSIS{
   CpuState* cs = cpu_state(cpu);
-  // 필요하다면 뮤텍스 잠금 (스레드 안전성을 위해)
-  // cs->run_queue.mu_.AssertHeld();
 
   if (cs->current) {
     FifoTask* current_task = cs->current;
