@@ -56,8 +56,8 @@ struct FifoTask : public Task<> {
   // that prevent other tasks from making progress.
   bool prio_boost = false;
   bool reset_runtime = false;
-
-  uint64_t runtime_at_first_pick_ns = 0; // 작업 실행 시작 시간
+  uint64_t remaining_runtime_ns;  
+  uint64_t runtime_at_last_check_ns = 0; // 작업 실행 시작 시간
 
 };
 

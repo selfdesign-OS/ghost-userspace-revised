@@ -77,20 +77,28 @@ void FifoScheduler::CpuTick(const Message& msg) {
   CheckPreemptTick(cpu);
 
 }
-void FifoScheduler::CheckPreemptTick(const Cpu& cpu) ABSL_NO_THREAD_SAFETY_ANALYSIS{
+void FifoScheduler::CheckPreemptTick(const Cpu& cpu) ABSL_NO_THREAD_SAFETY_ANALYSIS {
   CpuState* cs = cpu_state(cpu);
 
   if (cs->current) {
     FifoTask* current_task = cs->current;
-    uint64_t runtime = current_task->status_word.runtime();
-    uint64_t elapsed_time_ns = runtime - current_task->runtime_at_first_pick_ns;
+    uint64_t current_runtime_ns = current_task->status_word.runtime();
+    uint64_t elapsed_time_ns = current_runtime_ns - current_task->runtime_at_last_check_ns;
 
-    // 시간 슬라이스(예: 20ms)를 초과했는지 확인
-    if (absl::Nanoseconds(elapsed_time_ns) >= absl::Milliseconds(20)) {
+    // 남은 실행 시간에서 경과된 시간을 뺍니다.
+    if (elapsed_time_ns >= current_task->remaining_runtime_ns) {
+      current_task->remaining_runtime_ns = 0;
       cs->preempt_curr = true;
+    } else {
+      current_task->remaining_runtime_ns -= elapsed_time_ns;
     }
+
+    // runtime_at_last_check_ns를 현재 runtime으로 업데이트
+    current_task->runtime_at_last_check_ns = current_runtime_ns;
   }
 }
+
+
 
 // Implicitly thread-safe because it is only called from one agent associated
 // with the default queue.
@@ -197,6 +205,7 @@ void FifoScheduler::TaskYield(FifoTask* task, const Message& msg) {
       static_cast<const ghost_msg_payload_task_yield*>(msg.payload());
 
   TaskOffCpu(task, /*blocked=*/false, payload->from_switchto);
+  task->remaining_runtime_ns = 0;
 
   CpuState* cs = cpu_state_of(task);
   cs->run_queue.Enqueue(task);
@@ -212,6 +221,7 @@ void FifoScheduler::TaskBlocked(FifoTask* task, const Message& msg) {
       static_cast<const ghost_msg_payload_task_blocked*>(msg.payload());
 
   TaskOffCpu(task, /*blocked=*/true, payload->from_switchto);
+  task->remaining_runtime_ns = 0;
 
   if (payload->from_switchto) {
     Cpu cpu = topology()->cpu(payload->cpu);
@@ -250,7 +260,11 @@ void FifoScheduler::TaskOffCpu(FifoTask* task, bool blocked,
   if (task->oncpu()) {
     CHECK_EQ(cs->current, task);
     cs->current = nullptr;
-  } else {
+  } else if (task->queued()) {
+    // 태스크가 큐에 있는 경우 활성 큐와 만료 큐에서 제거합니다.
+    cs->run_queue.Erase(task);
+    cs->expired_queue.Erase(task);
+  }else {
     CHECK(from_switchto);
     CHECK_EQ(task->run_state, FifoTaskState::kBlocked);
   }
@@ -273,12 +287,17 @@ void FifoScheduler::TaskOnCpu(FifoTask* task, Cpu cpu) {
   task->cpu = cpu.id();
   task->preempted = false;
   task->prio_boost = false;
-  // runtime_at_first_pick_ns를 현재 누적 실행 시간으로 설정
-  if (task->reset_runtime) {
-    task->runtime_at_first_pick_ns = task->status_word.runtime();
-    task->reset_runtime = false;
+
+  // 남은 실행 시간이 없으면 새로운 시간 슬라이스를 설정
+  if (task->remaining_runtime_ns == 0) {
+    task->remaining_runtime_ns = absl::ToInt64Nanoseconds(absl::Milliseconds(5));  // 5ms를 나노초로 변환
   }
+
+  // runtime_at_last_check_ns를 현재 누적 실행 시간으로 설정
+  task->runtime_at_last_check_ns = task->status_word.runtime();
 }
+
+
 void FifoRq::swap(FifoRq& other) {
     // To prevent deadlocks, always lock the mutexes in the same order.
     // For example, lock the mutex with the lower memory address first.
@@ -291,7 +310,6 @@ void FifoRq::swap(FifoRq& other) {
     std::swap(this->rq_, other.rq_);
 }
 
-
 void FifoScheduler::FifoSchedule(const Cpu& cpu, BarrierToken agent_barrier, bool prio_boost) {
   CpuState* cs = cpu_state(cpu);
   FifoTask* next = cs->current;
@@ -299,9 +317,18 @@ void FifoScheduler::FifoSchedule(const Cpu& cpu, BarrierToken agent_barrier, boo
   // 선점이 필요한 경우 처리
   if (cs->preempt_curr) {
     if (next) {
-      // 현재 태스크를 expired_queue로 이동
+      // 현재 태스크를 적절한 큐로 이동
       TaskOffCpu(next, /*blocked=*/false, /*from_switchto=*/false);
-      cs->expired_queue.Enqueue(next);
+
+      if (next->remaining_runtime_ns > 0) {
+        // 남은 실행 시간이 있으면 활성 큐에 다시 추가
+        cs->run_queue.Enqueue(next);
+      } else {
+        // 실행 시간이 다 소진되었으면 만료 큐에 추가하고 remaining_runtime_ns 초기화
+        next->remaining_runtime_ns = 0;
+        cs->expired_queue.Enqueue(next);
+      }
+
       cs->current = nullptr;
       next = nullptr;
     }
@@ -310,6 +337,7 @@ void FifoScheduler::FifoSchedule(const Cpu& cpu, BarrierToken agent_barrier, boo
 
   if (!next) {
     if (cs->run_queue.Empty() && !cs->expired_queue.Empty()) {
+      GHOST_DPRINT(1, stderr, "swap completed");
       cs->run_queue.swap(cs->expired_queue);
     }
     next = cs->run_queue.Dequeue();
