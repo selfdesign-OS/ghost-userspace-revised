@@ -244,16 +244,7 @@ void FifoScheduler::TaskOnCpu(FifoTask* task, Cpu cpu) {
   task->cpu = cpu.id();
   task->preempted = false;
   task->prio_boost = false;
-
-  // 남은 실행 시간이 없으면 새로운 시간 슬라이스를 설정
-  if (task->runtime <= absl::ZeroDuration()) {
-    task->runtime = absl::Milliseconds(5);  // 시간 슬라이스를 5ms로 설정
-  }
-
-  // runtime_at_first_pick_ns를 현재 누적 실행 시간으로 설정
-  task->runtime_at_first_pick_ns = task->status_word.runtime();
 }
-
 
 void FifoScheduler::FifoSchedule(const Cpu& cpu, BarrierToken agent_barrier,
                                  bool prio_boost) {
