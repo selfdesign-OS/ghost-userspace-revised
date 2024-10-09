@@ -65,6 +65,13 @@ void OoneScheduler::EnclaveReady() {
       CHECK_EQ(errno, ESTALE);
     }
   }
+
+  // Enable tick msg delivery here instead of setting AgentConfig.tick_config_
+  // because the agent subscribing the default channel (mostly the
+  // channel/agent for the front CPU in the enclave) can get CpuTick messages
+  // for another CPU in the enclave while this function is trying to associate
+  // each agent to its corresponding channel.
+  enclave()->SetDeliverTicks(true);
 }
 
 // Implicitly thread-safe because it is only called from one agent associated
