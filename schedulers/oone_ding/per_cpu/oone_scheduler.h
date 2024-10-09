@@ -72,12 +72,17 @@ class OoneRq {
   // (e.g. via task->queued()).
   void Erase(OoneTask* task);
 
-  size_t Size() const {
+  size_t SizeOfAq() const {
     absl::MutexLock lock(&mu_);
     return aq_.size();
   }
 
-  bool Empty() const { return Size() == 0; }
+  size_t SizeOfEq() const {
+    absl::MutexLock lock(&mu_);
+    return eq_.size();
+  }
+
+  bool Empty() const { return SizeOfAq() == 0 && SizeOfEq() == 0; }
 
  private:
   mutable absl::Mutex mu_;

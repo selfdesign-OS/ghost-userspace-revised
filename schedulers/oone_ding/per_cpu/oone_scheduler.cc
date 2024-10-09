@@ -51,7 +51,7 @@ void OoneScheduler::DumpState(const Cpu& cpu, int flags) {
   const OoneTask* current = cs->current;
   const OoneRq* rq = &cs->run_queue;
   absl::FPrintF(stderr, "SchedState[%d]: %s aq_l=%lu\n", cpu.id(),
-                current ? current->gtid.describe() : "none", rq->Size());
+                current ? current->gtid.describe() : "none", rq->SizeOfAq());
 }
 
 void OoneScheduler::EnclaveReady() {
