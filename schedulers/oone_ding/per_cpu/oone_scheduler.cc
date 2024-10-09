@@ -252,6 +252,22 @@ void OoneScheduler::OoneSchedule(const Cpu& cpu, BarrierToken agent_barrier,
   OoneTask* next = nullptr;
   if (!prio_boost) {
     next = cs->current;
+
+    if (next) {
+      absl::Duration exec_time = absl::Now() - next->start_time;
+      next->time_slice -= exec_time; // 실행 시간 차감
+      
+      // expired queue로 이동할지 결정
+      if (next->time_slice <= absl::ZeroDuration()) {
+        GHOST_DPRINT(1, stderr, "CPU[%d]: %s - time slice expired", cpu.id(), next->gtid.describe());
+        next->SetTimeSlice(); // time slice 초기화하는 함수
+        cs->run_queue.EnqueueExpired(next);
+        next = nullptr;
+      } else {
+        next->start_time = absl::Now();
+      }
+    }
+
     if (!next) next = cs->run_queue.Dequeue();
   }
 
@@ -338,9 +354,25 @@ void OoneRq::Enqueue(OoneTask* task) {
     aq_.push_back(task);
 }
 
+void OoneRq::EnqueueExpired(OoneTask* task) {
+  CHECK_GE(task->cpu, 0);
+  CHECK_EQ(task->run_state, OoneTaskState::kRunnable);
+
+  task->run_state = OoneTaskState::kQueued;
+
+  absl::MutexLock lock(&mu_);
+  if (task->prio_boost)
+    eq_.push_front(task);
+  else
+    eq_.push_back(task);
+}
+
 OoneTask* OoneRq::Dequeue() {
   absl::MutexLock lock(&mu_);
-  if (aq_.empty()) return nullptr;
+  if (aq_.empty()) {
+    SwapQueue();
+    if (aq_.empty()) return nullptr;
+  }
 
   OoneTask* task = aq_.front();
   CHECK(task->queued());
@@ -352,6 +384,7 @@ OoneTask* OoneRq::Dequeue() {
 void OoneRq::Erase(OoneTask* task) {
   CHECK_EQ(task->run_state, OoneTaskState::kQueued);
   absl::MutexLock lock(&mu_);
+  //active queue에서 찾기
   size_t size = aq_.size();
   if (size > 0) {
     // Check if 'task' is at the back of the runqueue (common case).
@@ -371,6 +404,26 @@ void OoneRq::Erase(OoneTask* task) {
       }
     }
   }
+
+  // expired queue에서 찾기
+  size = eq_.size();
+  if (size > 0) {
+    size_t pos = size - 1;
+    if (eq_[pos] == task) {
+      eq_.erase(eq_.cbegin() + pos);
+      task->run_state = OoneTaskState::kRunnable;
+      return;
+    }
+
+    for (pos = 0; pos < size - 1; pos++) {
+      if (eq_[pos] == task) {
+        eq_.erase(eq_.cbegin() + pos);
+        task->run_state = OoneTaskState::kRunnable;
+        return;
+      }
+    }
+  }
+  // 못 찾은 경우
   CHECK(false);
 }
 
