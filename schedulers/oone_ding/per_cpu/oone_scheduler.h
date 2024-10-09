@@ -142,6 +142,10 @@ class OoneScheduler : public BasicDispatchScheduler<OoneTask> {
  private:
   void OoneSchedule(const Cpu& cpu, BarrierToken agent_barrier,
                     bool prio_boosted);
+
+  // Checks if we should preempt the current task. If so, sets preempt_curr_.
+  // Note: Should be called with this CPU's rq mutex lock held.
+  void CheckPreemptTick(const Cpu& cpu);
   void TaskOffCpu(OoneTask* task, bool blocked, bool from_switchto);
   void TaskOnCpu(OoneTask* task, Cpu cpu);
   void Migrate(OoneTask* task, Cpu cpu, BarrierToken seqnum);
