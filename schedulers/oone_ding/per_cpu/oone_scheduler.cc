@@ -105,6 +105,7 @@ void OoneScheduler::TaskNew(OoneTask* task, const Message& msg) {
       static_cast<const ghost_msg_payload_task_new*>(msg.payload());
 
   task->seqnum = msg.seqnum();
+  task->SetTimeSlice();
   task->run_state = OoneTaskState::kBlocked;
 
   if (payload->runnable) {
@@ -241,6 +242,7 @@ void OoneScheduler::TaskOnCpu(OoneTask* task, Cpu cpu) {
   GHOST_DPRINT(3, stderr, "Task %s oncpu %d", task->gtid.describe(), cpu.id());
 
   task->run_state = OoneTaskState::kOnCpu;
+  task->start_time = absl::Now();
   task->cpu = cpu.id();
   task->preempted = false;
   task->prio_boost = false;
@@ -370,8 +372,12 @@ void OoneRq::EnqueueExpired(OoneTask* task) {
 OoneTask* OoneRq::Dequeue() {
   absl::MutexLock lock(&mu_);
   if (aq_.empty()) {
-    SwapQueue();
-    if (aq_.empty()) return nullptr;
+    if (eq_.empty()) {
+      return nullptr;
+    } else {
+      GHOST_DPRINT(1, stderr, "[Swap Queue called] aq_size: %d, eq_size: %d", SizeOfAq(), SizeOfEq());
+      std::swap(aq_, eq_);
+    }
   }
 
   OoneTask* task = aq_.front();

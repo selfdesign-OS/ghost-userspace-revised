@@ -49,9 +49,9 @@ struct OoneTask : public Task<> {
   int cpu = -1;
 
   void SetTimeSlice() {
-    time_slice = absl::Milliseconds(10);
+    time_slice = absl::Nanoseconds(10000000);
   }
-  absl::Duration time_slice = absl::Milliseconds(10);
+  absl::Duration time_slice;
   absl::Time start_time;
 
   // Whether the last execution was preempted or not.
@@ -68,11 +68,6 @@ class OoneRq {
   OoneRq() = default;
   OoneRq(const OoneRq&) = delete;
   OoneRq& operator=(OoneRq&) = delete;
-
-  void SwapQueue() {
-    std::swap(aq_, eq_);
-    GHOST_DPRINT(1, stderr, "[Swap Queue called]");
-  }
 
   OoneTask* Dequeue();
   void Enqueue(OoneTask* task);
