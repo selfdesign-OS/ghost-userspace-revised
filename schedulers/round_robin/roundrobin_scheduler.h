@@ -28,8 +28,8 @@ enum class RoundRobinTaskState {
 std::ostream& operator<<(std::ostream& os, const RoundRobinTaskState& state);
 
 struct RoundRobinTask : public Task<> {
-  explicit RoundRobinTask(Gtid RounbRobin_task_gtid, ghost_sw_info sw_info)
-      : Task<>(RounbRobin_task_gtid, sw_info) {}
+  explicit RoundRobinTask(Gtid roundrobin_task_gtid, ghost_sw_info sw_info)
+      : Task<>(roundrobin_task_gtid, sw_info) {}
   ~RoundRobinTask() override {}
 
   inline bool blocked() const { return run_state == RoundRobinTaskState::kBlocked; }
@@ -55,13 +55,19 @@ struct RoundRobinTask : public Task<> {
   // wakeup - basically when it may be holding locks or other resources
   // that prevent other tasks from making progress.
   bool prio_boost = false;
+
+  // 추가
+  absl::Time time_slice;
+  // runtime_at_first_pick은 해당 태스크가 처음 선택되었을 때의 런타임
+  uint64_t runtime_at_first_pick_ns = 0;
+  bool runtime_change = false;
 };
 
-class RoundRobinTaskRq {
+class RoundRobinRq {
  public:
-  RoundRobinTaskRq() = default;
-  RoundRobinTaskRq(const RoundRobinTaskRq&) = delete;
-  RoundRobinTaskRq& operator=(RoundRobinTaskRq&) = delete;
+  RoundRobinRq() = default;
+  RoundRobinRq(const RoundRobinRq&) = delete;
+  RoundRobinRq& operator=(RoundRobinRq&) = delete;
 
   RoundRobinTask* Dequeue();
   void Enqueue(RoundRobinTask* task);
@@ -71,6 +77,7 @@ class RoundRobinTaskRq {
   // Caller must ensure that 'task' is on the runqueue in the first place
   // (e.g. via task->queued()).
   void Erase(RoundRobinTask* task);
+  
 
   size_t Size() const {
     absl::MutexLock lock(&mu_);
@@ -78,10 +85,15 @@ class RoundRobinTaskRq {
   }
 
   bool Empty() const { return Size() == 0; }
+  mutable absl::Mutex mu_;
+  
 
  private:
-  mutable absl::Mutex mu_;
+  // mutable absl::Mutex mu_;
   std::deque<RoundRobinTask*> rq_ ABSL_GUARDED_BY(mu_);
+
+  //void SwapQueue(RoundRobinRq* rq1, RoundRobinRq* rq2); 
+
 };
 
 class RoundRobinScheduler : public BasicDispatchScheduler<RoundRobinTask> {
@@ -91,7 +103,7 @@ class RoundRobinScheduler : public BasicDispatchScheduler<RoundRobinTask> {
   ~RoundRobinScheduler() final {}
 
   void Schedule(const Cpu& cpu, const StatusWord& sw);
-
+  void CheckTick(const Cpu& cpu);//tickcheck
   void EnclaveReady() final;
   Channel& GetDefaultChannel() final { return *default_channel_; };
 
@@ -125,6 +137,9 @@ class RoundRobinScheduler : public BasicDispatchScheduler<RoundRobinTask> {
   void TaskPreempted(RoundRobinTask* task, const Message& msg) final;
   void TaskSwitchto(RoundRobinTask* task, const Message& msg) final;
 
+  
+  
+
  private:
   void RoundRobinSchedule(const Cpu& cpu, BarrierToken agent_barrier,
                     bool prio_boosted);
@@ -137,7 +152,8 @@ class RoundRobinScheduler : public BasicDispatchScheduler<RoundRobinTask> {
   struct CpuState {
     RoundRobinTask* current = nullptr;
     std::unique_ptr<Channel> channel = nullptr;
-    RoundRobinTaskRq run_queue;
+    RoundRobinRq run_queue; // 활성 큐
+    RoundRobinRq expired_queue; // 만료 큐
   } ABSL_CACHELINE_ALIGNED;
 
   inline CpuState* cpu_state(const Cpu& cpu) { return &cpu_states_[cpu.id()]; }
@@ -150,9 +166,10 @@ class RoundRobinScheduler : public BasicDispatchScheduler<RoundRobinTask> {
 
   CpuState cpu_states_[MAX_CPUS];
   Channel* default_channel_ = nullptr;
+  
 };
 
-std::unique_ptr<RoundRobinScheduler> MultiThreadedRRScheduler(Enclave* enclave,
+std::unique_ptr<RoundRobinScheduler> MultiThreadedRoundRobinScheduler(Enclave* enclave,
                                                           CpuList cpulist);
 class RoundRobinAgent : public LocalAgent {
  public:
@@ -171,7 +188,7 @@ class FullRoundRobinAgent : public FullAgent<EnclaveType> {
  public:
   explicit FullRoundRobinAgent(AgentConfig config) : FullAgent<EnclaveType>(config) {
     scheduler_ =
-        MultiThreadedRRScheduler(&this->enclave_, *this->enclave_.cpus());
+        MultiThreadedRoundRobinScheduler(&this->enclave_, *this->enclave_.cpus());
     this->StartAgentTasks();
     this->enclave_.Ready();
   }
@@ -206,4 +223,4 @@ class FullRoundRobinAgent : public FullAgent<EnclaveType> {
 
 }  // namespace ghost
 
-#endif  // GHOST_SCHEDULERS_FIFO_FIFO_SCHEDULER_H
+#endif  // GHOST_SCHEDULERS_ROUNDROBIN_SCHEDULER_H
