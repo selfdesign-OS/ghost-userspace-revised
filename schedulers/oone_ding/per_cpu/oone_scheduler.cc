@@ -104,7 +104,6 @@ void OoneScheduler::TaskNew(OoneTask* task, const Message& msg) {
   // GHOST_DPRINT(1, stderr, "[TaskNew called]: %s", task->gtid.describe());
   const ghost_msg_payload_task_new* payload =
       static_cast<const ghost_msg_payload_task_new*>(msg.payload());
-
   task->seqnum = msg.seqnum();
   task->SetTimeSlice();
   task->run_state = OoneTaskState::kBlocked;
@@ -117,6 +116,7 @@ void OoneScheduler::TaskNew(OoneTask* task, const Message& msg) {
     // Wait until task becomes runnable to avoid race between migration
     // and MSG_TASK_WAKEUP showing up on the default channel.
   }
+  // GHOST_DPRINT(1, stderr, "[TaskNew]: %s", task->gtid.describe());
 }
 
 void OoneScheduler::TaskRunnable(OoneTask* task, const Message& msg) {
@@ -124,6 +124,7 @@ void OoneScheduler::TaskRunnable(OoneTask* task, const Message& msg) {
       static_cast<const ghost_msg_payload_task_wakeup*>(msg.payload());
 
   CHECK(task->blocked());
+  // GHOST_DPRINT(1, stderr, "[TaskRunnable]: %s", task->gtid.describe());
   task->run_state = OoneTaskState::kRunnable;
 
   // A non-deferrable wakeup gets the same preference as a preempted task.
@@ -189,7 +190,7 @@ void OoneScheduler::TaskBlocked(OoneTask* task, const Message& msg) {
       static_cast<const ghost_msg_payload_task_blocked*>(msg.payload());
 
   TaskOffCpu(task, /*blocked=*/true, payload->from_switchto);
-
+  // GHOST_DPRINT(1, stderr, "[TaskBlocked]: %s", task->gtid.describe());
   if (payload->from_switchto) {
     Cpu cpu = topology()->cpu(payload->cpu);
     enclave()->GetAgent(cpu)->Ping();
