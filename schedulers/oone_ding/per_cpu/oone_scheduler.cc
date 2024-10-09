@@ -323,7 +323,8 @@ void OoneScheduler::Schedule(const Cpu& cpu, const StatusWord& agent_sw) {
     Consume(cs->channel.get(), msg);
   }
 
-  OoneSchedule(cpu, agent_barrier, agent_sw.boosted_priority());
+  // OoneSchedule(cpu, agent_barrier, agent_sw.boosted_priority());
+  OoneSchedule(cpu, agent_barrier);
 }
 
 void OoneRq::Enqueue(OoneTask* task) {
