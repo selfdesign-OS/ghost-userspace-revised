@@ -729,6 +729,35 @@ cc_binary(
 )
 
 cc_library(
+    name = "oone_ding_per_cpu_scheduler",
+    srcs = [
+        "schedulers/oone_ding/per_cpu/oone_scheduler.cc",
+        "schedulers/oone_ding/per_cpu/oone_scheduler.h",
+    ],
+    hdrs = [
+        "schedulers/oone_ding/per_cpu/oone_scheduler.h",
+    ],
+    copts = compiler_flags,
+    deps = [
+        ":agent",
+    ],
+)
+
+cc_binary(
+    name = "oone_ding_per_cpu_agent",
+    srcs = [
+        "schedulers/oone_ding/per_cpu/oone_agent.cc",
+    ],
+    copts = compiler_flags,
+    deps = [
+        ":agent",
+        ":fifo_per_cpu_scheduler",
+        "@com_google_absl//absl/debugging:symbolize",
+        "@com_google_absl//absl/flags:parse",
+    ],
+)
+
+cc_library(
     name = "fifo_per_cpu_scheduler",
     srcs = [
         "schedulers/fifo/per_cpu/fifo_scheduler.cc",
