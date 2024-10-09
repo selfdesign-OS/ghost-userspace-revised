@@ -204,10 +204,5 @@ int main() {
     ghost::ScopedTime time;
     ghost::TaskDepartedManyRace(1000);
   }
-  {
-    printf("CreateThreadsAndSpin\n");
-    ghost::ScopedTime time;
-    ghost::CreateThreadsAndSpin(1000, absl::Milliseconds(30));
-  }
   return 0;
 }

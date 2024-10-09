@@ -251,17 +251,6 @@ void OoneScheduler::CheckPreemptTick(const Cpu& cpu)
   cs->run_queue.mu_.AssertHeld();
 
   if (cs->current) {
-    // If we were on cpu, check if we have run for longer than
-    // Granularity(). If so, force picking another task via setting current
-    // to nullptr.
-    if (absl::Nanoseconds(cs->current->status_word.runtime() -
-                          cs->current->runtime_at_first_pick_ns) >
-        cs->run_queue.MinPreemptionGranularity()) {
-      cs->preempt_curr = true;
-    }
-  }
-
-  if (cs->current) {
     OoneTask* task = cs->current;
     absl::Duration exec_time = absl::Now() - task->start_time;
     task->time_slice -= exec_time; // 실행 시간 차감
@@ -270,7 +259,7 @@ void OoneScheduler::CheckPreemptTick(const Cpu& cpu)
     if (task->time_slice <= absl::ZeroDuration()) {
       GHOST_DPRINT(1, stderr, "CPU[%d]: %s - time slice expired", cpu.id(), task->gtid.describe());
       task->SetTimeSlice(); // time slice 초기화하는 함수
-      cs->run_queue.EnqueueExpired(next);
+      cs->run_queue.EnqueueExpired(task);
       task = nullptr;
     } else {
       task->start_time = absl::Now();
