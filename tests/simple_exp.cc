@@ -142,10 +142,9 @@ void TaskDepartedManyRace(int num_threads) {
   );
 }
 
-void SpinFor(absl::Duration d) {
+void SpinFor2(absl::Duration d) {
   absl::Time end_time = absl::Now() + d;
   while (absl::Now() < end_time) {
-    // 바쁜 대기: 여기에서 CPU 사용
     for (int i = 0; i < 1000; ++i) {
       asm volatile("" : : : "memory");  // CPU 최적화를 방지하기 위해 빈 명령어 삽입
     }
@@ -155,7 +154,7 @@ void SpinFor(absl::Duration d) {
 void TaskDepartedManyRace2(int num_threads) {
   RemoteThreadTester().Run(
     [] {  // ghost threads
-      SpinFor(absl::Milliseconds(20));  // absl::SleepFor 대신 SpinFor 사용
+      SpinFor2(absl::Milliseconds(20));  // absl::SleepFor 대신 SpinFor 사용
     },
     [](GhostThread* t) {  // remote, per-thread work
       const sched_param param{};
