@@ -751,7 +751,7 @@ cc_binary(
     copts = compiler_flags,
     deps = [
         ":agent",
-        ":fifo_per_cpu_scheduler",
+        ":oone_ding_per_cpu_scheduler",
         "@com_google_absl//absl/debugging:symbolize",
         "@com_google_absl//absl/flags:parse",
     ],
