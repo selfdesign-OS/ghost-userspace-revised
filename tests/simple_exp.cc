@@ -151,17 +151,23 @@ void SpinFor2(absl::Duration d) {
   }
 }
 
-void TaskDepartedManyRace2(int num_threads) {
-  RemoteThreadTester().Run(
-    [] {  // ghost threads
-      SpinFor2(absl::Milliseconds(20));  // absl::SleepFor 대신 SpinFor 사용
-    },
-    [](GhostThread* t) {  // remote, per-thread work
-      const sched_param param{};
-      CHECK_EQ(sched_setscheduler(t->tid(), SCHED_OTHER, &param), 0);
-      CHECK_EQ(sched_getscheduler(t->tid()), SCHED_OTHER);
-    }
-  );
+void CreateThreadsAndSpin(int num_threads, absl::Duration spin_duration) {
+  std::vector<std::unique_ptr<GhostThread>> threads;
+  
+  threads.reserve(num_threads);
+  
+  for (int i = 0; i < num_threads; ++i) {
+    threads.emplace_back(
+      new GhostThread(GhostThread::KernelScheduler::kGhost, [spin_duration] {
+        // 각 스레드가 일정 시간 동안 CPU를 차지하는 작업 수행
+        SpinFor2(spin_duration);
+      }));
+  }
+  
+  // 모든 스레드가 완료될 때까지 대기
+  for (auto& t : threads) {
+    t->Join();
+  }
 }
 
 }  // namespace
@@ -199,9 +205,9 @@ int main() {
     ghost::TaskDepartedManyRace(1000);
   }
   {
-    printf("TaskDepartedManyRace2\n");
+    printf("CreateThreadsAndSpin\n");
     ghost::ScopedTime time;
-    ghost::TaskDepartedManyRace2(1000);
+    CreateThreadsAndSpin(1000, absl::Milliseconds(20));
   }
   return 0;
 }
