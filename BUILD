@@ -242,6 +242,18 @@ cc_binary(
 )
 
 cc_binary(
+    name = "test_any",
+    srcs = [
+        "tests/run_as_ghost.cc",
+    ],
+    copts = compiler_flags,
+    deps = [
+        ":base",
+        ":ghost",
+    ],
+)
+
+cc_binary(
     name = "simple_exp",
     srcs = [
         "tests/simple_exp.cc",
