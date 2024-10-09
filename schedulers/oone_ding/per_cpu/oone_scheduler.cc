@@ -32,7 +32,7 @@ void OoneScheduler::DumpAllTasks() {
   allocator()->ForEachTask([](Gtid gtid, const OoneTask* task) {
     absl::FPrintF(stderr, "%-12s%-8d%-8d%c%c\n", gtid.describe(),
                   task->run_state, task->cpu, task->preempted ? 'P' : '-',
-                  '-');
+                  task->prio_boost ? 'B' : '-');
     return true;
   });
 }
@@ -127,7 +127,7 @@ void OoneScheduler::TaskRunnable(OoneTask* task, const Message& msg) {
   // A non-deferrable wakeup gets the same preference as a preempted task.
   // This is because it may be holding locks or resources needed by other
   // tasks to make progress.
-  // task->prio_boost = !payload->deferrable;
+  task->prio_boost = !payload->deferrable;
 
   if (task->cpu < 0) {
     // There cannot be any more messages pending for this task after a
@@ -201,7 +201,7 @@ void OoneScheduler::TaskPreempted(OoneTask* task, const Message& msg) {
   TaskOffCpu(task, /*blocked=*/false, payload->from_switchto);
 
   task->preempted = true;
-  // task->prio_boost = true;
+  task->prio_boost = true;
   CpuState* cs = cpu_state_of(task);
   cs->run_queue.Enqueue(task);
 
@@ -243,22 +243,21 @@ void OoneScheduler::TaskOnCpu(OoneTask* task, Cpu cpu) {
   task->run_state = OoneTaskState::kOnCpu;
   task->cpu = cpu.id();
   task->preempted = false;
-  // task->prio_boost = false;
+  task->prio_boost = false;
 }
 
-void OoneScheduler::OoneSchedule(const Cpu& cpu, BarrierToken agent_barrier) {
+void OoneScheduler::OoneSchedule(const Cpu& cpu, BarrierToken agent_barrier,
+                                 bool prio_boost) {
   CpuState* cs = cpu_state(cpu);
   OoneTask* next = nullptr;
-  // if (!prio_boost) {
-  //   next = cs->current;
-  //   if (!next) next = cs->run_queue.Dequeue();
-  // }
-  next = cs->current;
-  if (!next) next = cs->run_queue.Dequeue();
+  if (!prio_boost) {
+    next = cs->current;
+    if (!next) next = cs->run_queue.Dequeue();
+  }
 
   GHOST_DPRINT(3, stderr, "OoneSchedule %s on %s cpu %d ",
                next ? next->gtid.describe() : "idling",
-               "", cpu.id());
+               prio_boost ? "prio-boosted" : "", cpu.id());
 
   RunRequest* req = enclave()->GetRunRequest(cpu);
   if (next) {
@@ -296,16 +295,16 @@ void OoneScheduler::OoneSchedule(const Cpu& cpu, BarrierToken agent_barrier) {
       }
 
       // Txn commit failed so push 'next' to the front of runqueue.
-      // next->prio_boost = true;
+      next->prio_boost = true;
       cs->run_queue.Enqueue(next);
     }
   } else {
     // If LocalYield is due to 'prio_boost' then instruct the kernel to
     // return control back to the agent when CPU is idle.
     int flags = 0;
-    // if (prio_boost && (cs->current || !cs->run_queue.Empty())) {
-    //   flags = RTLA_ON_IDLE;
-    // }
+    if (prio_boost && (cs->current || !cs->run_queue.Empty())) {
+      flags = RTLA_ON_IDLE;
+    }
     req->LocalYield(agent_barrier, flags);
   }
 }
@@ -323,8 +322,7 @@ void OoneScheduler::Schedule(const Cpu& cpu, const StatusWord& agent_sw) {
     Consume(cs->channel.get(), msg);
   }
 
-  // OoneSchedule(cpu, agent_barrier, agent_sw.boosted_priority());
-  OoneSchedule(cpu, agent_barrier);
+  OoneSchedule(cpu, agent_barrier, agent_sw.boosted_priority());
 }
 
 void OoneRq::Enqueue(OoneTask* task) {
@@ -334,11 +332,10 @@ void OoneRq::Enqueue(OoneTask* task) {
   task->run_state = OoneTaskState::kQueued;
 
   absl::MutexLock lock(&mu_);
-  // if (task->prio_boost)
-  //   aq_.push_front(task);
-  // else
-  //   aq_.push_back(task);
-  aq_.push_back(task);
+  if (task->prio_boost)
+    aq_.push_front(task);
+  else
+    aq_.push_back(task);
 }
 
 OoneTask* OoneRq::Dequeue() {

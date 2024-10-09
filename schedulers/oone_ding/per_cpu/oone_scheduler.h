@@ -132,7 +132,8 @@ class OoneScheduler : public BasicDispatchScheduler<OoneTask> {
   void TaskSwitchto(OoneTask* task, const Message& msg) final;
 
  private:
-  void OoneSchedule(const Cpu& cpu, BarrierToken agent_barrier);
+  void OoneSchedule(const Cpu& cpu, BarrierToken agent_barrier,
+                    bool prio_boosted);
   void TaskOffCpu(OoneTask* task, bool blocked, bool from_switchto);
   void TaskOnCpu(OoneTask* task, Cpu cpu);
   void Migrate(OoneTask* task, Cpu cpu, BarrierToken seqnum);
