@@ -254,12 +254,15 @@ void OoneScheduler::OoneSchedule(const Cpu& cpu, BarrierToken agent_barrier,
                                  bool prio_boost) {
   CpuState* cs = cpu_state(cpu);
   OoneTask* next = nullptr;
+
   if (!prio_boost) {
     next = cs->current;
 
     if (next) {
       absl::Duration exec_time = absl::Now() - next->start_time;
       next->time_slice -= exec_time; // 실행 시간 차감
+
+      GHOST_DPRINT(1, stderr, "[OoneSchedule]: %s, remaining time: %ld", next->gtid.describe(), absl::ToInt64Nanoseconds(next->time_slice));
       
       // expired queue로 이동할지 결정
       if (next->time_slice <= absl::ZeroDuration()) {
