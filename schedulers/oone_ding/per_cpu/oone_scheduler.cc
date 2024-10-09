@@ -239,28 +239,44 @@ void OoneScheduler::CpuTick(const Message& msg) {
   // called, which contains the logic for figuring out if we should run the
   // task that was running before we got preempted the agent or if we should
   // reach into our rb tree.
-  // CheckPreemptTick(cpu);
+  CheckPreemptTick(cpu);
 }
 
-// // Disable thread safety analysis as this function is called with rq lock held
-// // but it's hard for the compiler to infer. Without this annotation, the
-// // compiler raises safety analysis error.
-// void OoneScheduler::CheckPreemptTick(const Cpu& cpu)
-//   ABSL_NO_THREAD_SAFETY_ANALYSIS {
-//   CpuState* cs = cpu_state(cpu);
-//   cs->run_queue.mu_.AssertHeld();
+// Disable thread safety analysis as this function is called with rq lock held
+// but it's hard for the compiler to infer. Without this annotation, the
+// compiler raises safety analysis error.
+void OoneScheduler::CheckPreemptTick(const Cpu& cpu)
+  ABSL_NO_THREAD_SAFETY_ANALYSIS {
+  CpuState* cs = cpu_state(cpu);
+  cs->run_queue.mu_.AssertHeld();
 
-//   if (cs->current) {
-//     // If we were on cpu, check if we have run for longer than
-//     // Granularity(). If so, force picking another task via setting current
-//     // to nullptr.
-//     if (absl::Nanoseconds(cs->current->status_word.runtime() -
-//                           cs->current->runtime_at_first_pick_ns) >
-//         cs->run_queue.MinPreemptionGranularity()) {
-//       cs->preempt_curr = true;
-//     }
-//   }
-// }
+  if (cs->current) {
+    // If we were on cpu, check if we have run for longer than
+    // Granularity(). If so, force picking another task via setting current
+    // to nullptr.
+    if (absl::Nanoseconds(cs->current->status_word.runtime() -
+                          cs->current->runtime_at_first_pick_ns) >
+        cs->run_queue.MinPreemptionGranularity()) {
+      cs->preempt_curr = true;
+    }
+  }
+
+  if (cs->current) {
+    OoneTask* task = cs->current;
+    absl::Duration exec_time = absl::Now() - task->start_time;
+    task->time_slice -= exec_time; // 실행 시간 차감
+
+    // expired queue로 이동할지 결정
+    if (task->time_slice <= absl::ZeroDuration()) {
+      GHOST_DPRINT(1, stderr, "CPU[%d]: %s - time slice expired", cpu.id(), task->gtid.describe());
+      task->SetTimeSlice(); // time slice 초기화하는 함수
+      cs->run_queue.EnqueueExpired(next);
+      task = nullptr;
+    } else {
+      task->start_time = absl::Now();
+    }
+  }
+}
 
 void OoneScheduler::TaskOffCpu(OoneTask* task, bool blocked,
                                bool from_switchto) {
@@ -300,24 +316,6 @@ void OoneScheduler::OoneSchedule(const Cpu& cpu, BarrierToken agent_barrier,
 
   if (!prio_boost) {
     next = cs->current;
-
-    if (next) {
-      absl::Duration exec_time = absl::Now() - next->start_time;
-      next->time_slice -= exec_time; // 실행 시간 차감
-
-      GHOST_DPRINT(1, stderr, "[OoneSchedule]: %s, remaining time: %ld", next->gtid.describe(), absl::ToInt64Nanoseconds(next->time_slice));
-      
-      // expired queue로 이동할지 결정
-      if (next->time_slice <= absl::ZeroDuration()) {
-        GHOST_DPRINT(1, stderr, "CPU[%d]: %s - time slice expired", cpu.id(), next->gtid.describe());
-        next->SetTimeSlice(); // time slice 초기화하는 함수
-        cs->run_queue.EnqueueExpired(next);
-        next = nullptr;
-      } else {
-        next->start_time = absl::Now();
-      }
-    }
-
     if (!next) next = cs->run_queue.Dequeue();
   }
 
