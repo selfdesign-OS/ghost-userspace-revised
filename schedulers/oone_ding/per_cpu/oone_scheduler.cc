@@ -219,6 +219,21 @@ void OoneScheduler::TaskSwitchto(OoneTask* task, const Message& msg) {
   TaskOffCpu(task, /*blocked=*/true, /*from_switchto=*/false);
 }
 
+void OoneScheduler::CpuTick(const Message& msg) {
+  const ghost_msg_payload_cpu_tick* payload =
+      static_cast<const ghost_msg_payload_cpu_tick*>(msg.payload());
+  Cpu cpu = topology()->cpu(payload->cpu);
+  CpuState* cs = cpu_state(cpu);
+  cs->run_queue.mu_.AssertHeld();
+
+  // We do not actually need any logic in CpuTick for preemption. Since
+  // CpuTick messages wake up the agent, CfsSchedule will eventually be
+  // called, which contains the logic for figuring out if we should run the
+  // task that was running before we got preempted the agent or if we should
+  // reach into our rb tree.
+  CheckPreemptTick(cpu);
+}
+
 
 void OoneScheduler::TaskOffCpu(OoneTask* task, bool blocked,
                                bool from_switchto) {

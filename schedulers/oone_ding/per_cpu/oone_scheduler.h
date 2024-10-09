@@ -137,6 +137,7 @@ class OoneScheduler : public BasicDispatchScheduler<OoneTask> {
   void TaskBlocked(OoneTask* task, const Message& msg) final;
   void TaskPreempted(OoneTask* task, const Message& msg) final;
   void TaskSwitchto(OoneTask* task, const Message& msg) final;
+  void CpuTick(const Message& msg) final;
 
  private:
   void OoneSchedule(const Cpu& cpu, BarrierToken agent_barrier,
