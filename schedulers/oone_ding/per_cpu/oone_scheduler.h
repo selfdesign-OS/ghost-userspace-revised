@@ -74,14 +74,15 @@ class OoneRq {
 
   size_t Size() const {
     absl::MutexLock lock(&mu_);
-    return rq_.size();
+    return aq_.size();
   }
 
   bool Empty() const { return Size() == 0; }
 
  private:
   mutable absl::Mutex mu_;
-  std::deque<OoneTask*> rq_ ABSL_GUARDED_BY(mu_);
+  std::deque<OoneTask*> aq_ ABSL_GUARDED_BY(mu_);
+  std::deque<OoneTask*> eq_ ABSL_GUARDED_BY(mu_);
 };
 
 class OoneScheduler : public BasicDispatchScheduler<OoneTask> {
