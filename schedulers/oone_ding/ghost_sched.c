@@ -3,6 +3,10 @@
 #include <stdio.h>
 #include <dlfcn.h>
 
+#ifndef SCHED_GHOST
+#define SCHED_GHOST 18
+#endif
+
 int sched_setscheduler(pid_t pid, int policy, const struct sched_param *param) {
     // 원래의 sched_setscheduler 함수 호출을 가로채서 SCHED_GHOST로 강제 설정
     static int (*real_sched_setscheduler)(pid_t, int, const struct sched_param *);
