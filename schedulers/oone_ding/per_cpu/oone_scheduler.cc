@@ -101,7 +101,7 @@ void OoneScheduler::Migrate(OoneTask* task, Cpu cpu, BarrierToken seqnum) {
 }
 
 void OoneScheduler::TaskNew(OoneTask* task, const Message& msg) {
-  GHOST_DPRINT(1, stderr, "[TaskNew called]: %s", task->gtid.describe());
+  // GHOST_DPRINT(1, stderr, "[TaskNew called]: %s", task->gtid.describe());
   const ghost_msg_payload_task_new* payload =
       static_cast<const ghost_msg_payload_task_new*>(msg.payload());
 
