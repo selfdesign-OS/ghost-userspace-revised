@@ -130,7 +130,8 @@ void OoneScheduler::TaskRunnable(OoneTask* task, const Message& msg) {
   // A non-deferrable wakeup gets the same preference as a preempted task.
   // This is because it may be holding locks or resources needed by other
   // tasks to make progress.
-  task->prio_boost = !payload->deferrable;
+  // task->prio_boost = !payload->deferrable;
+  task->prio_boost = false;
 
   if (task->cpu < 0) {
     // There cannot be any more messages pending for this task after a

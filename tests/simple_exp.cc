@@ -207,7 +207,7 @@ int main() {
   {
     printf("CreateThreadsAndSpin\n");
     ghost::ScopedTime time;
-    CreateThreadsAndSpin(1000, absl::Milliseconds(20));
+    ghost::CreateThreadsAndSpin(1000, absl::Milliseconds(30));
   }
   return 0;
 }
